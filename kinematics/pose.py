@@ -8,7 +8,7 @@ inverse_kinematics(y) arma (da, R) a partir de (alpha, beta) vía TIK.
 import numpy as np
 
 from kinematics.inverse import PIK
-from config.parameters import D
+import config.parameters as _params
 
 
 def rpy_to_R(roll: float, pitch: float, yaw: float) -> np.ndarray:
@@ -30,16 +30,17 @@ def rpy_to_R(roll: float, pitch: float, yaw: float) -> np.ndarray:
     return Rz @ Ry @ Rx
 
 
-def pose_to_q(x: float, y: float, z: float, roll: float, pitch: float, yaw: float):
+def pose_to_q(x: float, y: float, z: float, roll: float, pitch: float, yaw: float, D=None, Az=None, Bz=None):
     """Pose cartesiana (mm, rad) -> longitudes de actuador en mm, vía PIK.
 
     da = D + [x, y, z]   (mismo convenio de traslación que usa TIK: origen de plataforma
-                          respecto a la base, desplazado por D)
+                          respecto a la base, desplazado por D; en x=y=z=0 y R=I está en HOME con 0 mm de extensión)
     R  = rpy_to_R(roll, pitch, yaw)
     
     Returns: q_mm (largo total ancla a ancla, sin restar L0), da (mm), R (3x3)
     """
-    da = D + np.array([x, y, z])
+    d_base = _params.D if D is None else np.asarray(D, dtype=np.float64)
+    da = d_base + np.array([x, y, z], dtype=np.float64)
     R = rpy_to_R(roll, pitch, yaw)
-    q_mm = PIK(da, R)
+    q_mm = PIK(da, R, Az=Az, Bz=Bz)
     return q_mm, da, R

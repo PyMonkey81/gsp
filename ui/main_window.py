@@ -22,10 +22,11 @@ from config.parameters import (
     LIMITS_ALPHA, LIMITS_BETA, AVAILABLE_BAUDRATES, DEFAULT_BAUDRATE,
     BASE_JOINTS, PLATFORM_JOINTS, Az, Bz, D, RT, ALPHA_0, L0, STROKE,
     T_HOME_END, T_TRACKING_END, DT, FILTER_WN, DEMO_DURATION, TRAJ_POINTS,
-    length_to_percent, percent_to_length
+    length_to_percent, percent_to_length, q_to_extension, extension_to_q
 )
 from core.kinematics import (
-    pose_to_q, inverse_kinematics, InvJac, calculate_singularity_metrics, SimpleCubicSpline
+    pose_to_q, inverse_kinematics, direct_kinematics, home_kinematics,
+    InvJac, calculate_singularity_metrics, SimpleCubicSpline
 )
 from trajectory.generator import TrajectoryConfig, TrajectoryGenerator
 from connection.serial_manager import SerialManager
@@ -52,26 +53,30 @@ class MainWindow(QMainWindow):
         self.resize(1440, 920)
         self.setMinimumSize(1100, 720)
 
+        # Synchronize runtime parameters from config/parameters.json
+        self._sync_runtime_parameters(load_parameters())
+
         # Initialize Serial Communication Manager
         self.serial_manager = SerialManager(self)
 
-        # State Variables
-        self.current_da = D.copy()
-        self.current_R = np.eye(3, dtype=np.float64)
-        self.current_q = np.array([Q_NOMINAL] * 6, dtype=np.float64)
+        # State Variables initialized at HOME (all actuators retracted = 0.0 mm extension)
+        q_home, da_home, R_home = home_kinematics()
+        self.current_da = da_home.copy()
+        self.current_R = R_home.copy()
+        self.current_q = q_home.copy()
         self.current_pct = np.zeros(6, dtype=np.float64)
-        self.actual_q = np.array([Q_NOMINAL] * 6, dtype=np.float64)
+        self.actual_q = q_home.copy()
         self.control_mode = "CARTESIAN"  # 'CARTESIAN', 'TRACK', or 'IDLE'
 
         # Trajectory Tracking Engine using authentic TrajectoryGenerator
         self.traj_cfg = TrajectoryConfig(
-            t_home_end=T_HOME_END,
-            t_tracking_end=T_TRACKING_END,
-            dt=DT,
-            filter_wn=FILTER_WN
+            t_home_end=param_module.T_HOME_END,
+            t_tracking_end=param_module.T_TRACKING_END,
+            dt=param_module.DT,
+            filter_wn=param_module.FILTER_WN
         )
         self.traj_gen = TrajectoryGenerator(self.traj_cfg)
-        self.current_traj_points = [list(pt) for pt in TRAJ_POINTS]
+        self.current_traj_points = [list(pt) for pt in param_module.TRAJ_POINTS]
         self.traj_gen.set_tracking_points(np.radians(self.current_traj_points))
 
         self.traj_timer = QTimer(self)
@@ -79,19 +84,21 @@ class MainWindow(QMainWindow):
         self.traj_start_time = 0.0
         self.traj_pause_time = 0.0
         self.traj_elapsed = 0.0
-        self.traj_duration = DEMO_DURATION
+        self.traj_duration = param_module.DEMO_DURATION
         self.is_tracking = False
         self.is_traj_paused = False
         self.hold_phase = None
         self.last_tick_time = 0.0
         self.custom_traj_points = None
+        self.csv_trajectory = None
+        self.is_csv_playback = False
 
         # Build UI Structure
         self._setup_ui()
         self._connect_signals()
 
-        # Perform initial kinematics calculation
-        self._on_cartesian_changed()
+        # Initialize platform at HOME (all actuators retracted at 0.0 mm)
+        self.go_home()
 
     def _setup_ui(self):
         """Construct the entire interface layout."""
@@ -714,7 +721,7 @@ class MainWindow(QMainWindow):
         vals = np.array(actual_vals, dtype=np.float64)
         if len(vals) == 6:
             if np.max(vals) <= 100.0:
-                self.actual_q = percent_to_length(vals, L0, STROKE)
+                self.actual_q = percent_to_length(vals, param_module.L0, param_module.STROKE)
             else:
                 self.actual_q = vals
             # Update telemetry plot with target vs actual
@@ -757,18 +764,27 @@ class MainWindow(QMainWindow):
         )
 
     def _on_track_angles_changed(self):
-        """Called when Alpha or Beta slider / spinbox changes."""
+        """Called when Alpha or Beta slider / spinbox changes (hemisphere constraint active)."""
         if self.is_tracking:
             return  # During active trajectory, let TrajectoryGenerator drive angles
 
         alpha = self.spin_alpha.value()
-        beta = self.spin_beta.value()
+        beta = float(np.clip(self.spin_beta.value(), 0.0, 90.0))
 
-        # Compute Inverse Kinematics (beta is elevation from horizon, 90° = Zenith)
-        q_mm, da, R = inverse_kinematics([alpha, beta], rt=RT, a0=ALPHA_0, D=D, deg=True)
+        # Compute Inverse Kinematics on the hemisphere (da = D + rt * R[:, 2], beta in [0°, 90°])
+        q_mm, da, R = inverse_kinematics(
+            [alpha, beta],
+            rt=param_module.RT,
+            a0=param_module.ALPHA_0,
+            D=param_module.D,
+            deg=True,
+            clamp_hemisphere=True
+        )
         self._apply_kinematics_result(q_mm, da, R)
 
-        self.lbl_sb_pose.setText(f"Track: α: {alpha:+.1f}° | β: {beta:.1f}° | Z: {da[2]:.1f} mm")
+        self.lbl_sb_pose.setText(
+            f"Track (Semiesfera rt={param_module.RT:.0f}mm): α: {alpha:+.1f}° | β: {beta:.1f}° | Z: {da[2]:.1f} mm"
+        )
 
     def _apply_kinematics_result(self, q_mm: np.ndarray, da: np.ndarray, R: np.ndarray):
         """
@@ -778,15 +794,17 @@ class MainWindow(QMainWindow):
         self.current_q = q_mm
         self.current_da = da
         self.current_R = R
+        if not self.serial_manager.is_connected:
+            self.actual_q = q_mm.copy()
 
         # 1. Update 3D OpenGL View
         self.gl_view.update_platform(da, R, q_mm)
 
-        # 2. Update Actuator Level Bars
+        # 2. Update Actuator Level Bars (shows extension q_ef = q_mm - L0 in mm; HOME = 0.0 mm)
         self.actuator_cluster.update_actuators(q_mm)
 
         # 3. Calculate Jacobian and Singularity Metrics
-        J_inv = InvJac(da, R, Az=Az, Bz=Bz)
+        J_inv = InvJac(da, R, Az=param_module.Az, Bz=param_module.Bz)
         metrics = calculate_singularity_metrics(J_inv)
 
         self.lbl_manip_val.setText(f"{metrics['manipulability']:.2e}")
@@ -812,7 +830,7 @@ class MainWindow(QMainWindow):
         self.txt_matrix.setText(mat_str)
 
         # 5. Convert to stroke percent and stream serial command if enabled
-        pct = length_to_percent(q_mm, l0=L0, stroke=STROKE)
+        pct = length_to_percent(q_mm, l0=param_module.L0, stroke=param_module.STROKE)
         self.current_pct = pct
 
         if self.chk_stream.isChecked() and self.serial_manager.is_connected:
@@ -840,25 +858,63 @@ class MainWindow(QMainWindow):
                 self.spins_rot[rot].blockSignals(False)
 
     # =========================================================================
-    # TRAJECTORY TRACKING (TrajectoryGenerator 4-Phase Sequence)
+    # TRAJECTORY TRACKING (4-Phase Sequence & MATLAB CSV Playback)
     # =========================================================================
     def start_trajectory_tracking(self):
         """
-        Execute full 4-phase trajectory sequence:
-        HOME → APPROACH → TRACK → RETURN → HOME
-        Uses authentic TrajectoryGenerator with 2nd order filtering.
+        Execute trajectory sequence:
+        - If 'Waypoints Personalizados (CSV)' is selected and a CSV trajectory is loaded:
+          reproduces the smoothly interpolated CSV sequence (either alpha/beta via Inverse Kinematics
+          or L1..L6 directly).
+        - Otherwise: executes the 4-phase sequence HOME (0 mm) → APPROACH → TRACK → RETURN → HOME (0 mm).
         """
         pattern = self.combo_traj_pattern.currentText()
         duration = self.spin_traj_dur.value()
         amp_beta = self.spin_traj_amp.value()
 
+        # Case 1: Continuous MATLAB CSV Trajectory Playback
+        if "Waypoints Personalizados" in pattern and self.csv_trajectory is not None:
+            try:
+                csv_dur = float(self.csv_trajectory["duration"])
+                self.traj_duration = float(duration) if duration > 0.0 else max(csv_dur, 1.0)
+                self.traj_elapsed = 0.0
+                self.last_tick_time = time.time()
+                self.is_tracking = True
+                self.is_csv_playback = True
+                self.is_traj_paused = False
+                self.hold_phase = "CSV"
+
+                self.btn_start_track.setEnabled(False)
+                self.btn_pause_track.setText("⏸ PAUSA TRACK")
+                self.traj_progress.setValue(0)
+                self.badge_mode.set_status("TRAJ: CSV", "cyan")
+                self.traj_timer.start()
+
+                mode_label = (
+                    "α/β (Cinemática Inversa)"
+                    if self.csv_trajectory["mode"] == "alpha_beta"
+                    else "L1–L6 Directo"
+                )
+                self.log_message(
+                    f"[CSV] Reproducción iniciada ({mode_label}): "
+                    f"{self.csv_trajectory['num_points']} puntos originales, "
+                    f"duración={self.traj_duration:.2f}s."
+                )
+                return
+            except Exception as e:
+                self.log_error(f"[CSV] Error iniciando reproducción CSV: {e}")
+                return
+
+        # Case 2: Standard 4-phase TrajectoryGenerator sequence
+        self.is_csv_playback = False
+
         # Partition duration: home/approach (min 10s or 16%), track, return
         t_home = min(10.0, max(2.0, duration * (10.0 / 60.0)))
         t_track = max(t_home + 2.0, duration - t_home)
 
-        # Select 3 waypoints [alpha, beta] in degrees (beta = elevation from horizon)
+        # Select 3 waypoints [alpha, beta] in degrees (beta = elevation from horizon in [0°, 90°])
         if "Secuencia Demo" in pattern:
-            pts_deg = [list(pt) for pt in TRAJ_POINTS]
+            pts_deg = [list(pt) for pt in self.current_traj_points]
         elif "Precesión" in pattern:
             elev = max(5.0, 90.0 - amp_beta)
             pts_deg = [[0.0, elev], [180.0, elev], [360.0, elev]]
@@ -873,7 +929,7 @@ class MainWindow(QMainWindow):
         elif "Waypoints Personalizados" in pattern and self.custom_traj_points is not None:
             pts_deg = [list(pt) for pt in self.custom_traj_points]
         else:
-            pts_deg = [list(pt) for pt in TRAJ_POINTS]
+            pts_deg = [list(pt) for pt in self.current_traj_points]
 
         try:
             pts_rad = np.radians(pts_deg)
@@ -881,7 +937,7 @@ class MainWindow(QMainWindow):
                 t_home_end=t_home,
                 t_tracking_end=t_track,
                 dt=0.033,
-                filter_wn=FILTER_WN
+                filter_wn=param_module.FILTER_WN
             )
             self.traj_gen = TrajectoryGenerator(self.traj_cfg)
             self.traj_gen.set_tracking_points(pts_rad)
@@ -901,15 +957,105 @@ class MainWindow(QMainWindow):
             self.traj_timer.start()
 
             self.log_message(
-                f"[TRAJ] Secuencia iniciada: {pattern} (Total: {self.traj_duration:.1f}s, "
-                f"Approach: {t_home:.1f}s, Track: {t_track - t_home:.1f}s, Return: {t_home:.1f}s)"
+                f"[TRAJ] Secuencia iniciada desde HOME (0 mm): {pattern} (Total: {self.traj_duration:.1f}s, "
+                f"Approach: {t_home:.1f}s, Track: {t_track - t_home:.1f}s, Return: {t_home:.1f}s, rt={param_module.RT:.1f}mm)"
             )
         except Exception as e:
             self.log_error(f"[TRAJ] Error iniciando generador de trayectoria: {e}")
 
+    def _eval_csv_trajectory(self, t_csv: float) -> np.ndarray:
+        """Evaluate smoothly interpolated CSV trajectory at time t_csv."""
+        traj = self.csv_trajectory
+        t_clamped = float(np.clip(t_csv, 0.0, traj["duration"]))
+        if traj["spline"] is not None:
+            return np.asarray(traj["spline"](t_clamped), dtype=np.float64)
+        # Dense linear interpolation fallback
+        t_arr = traj["t_dense"]
+        y_arr = traj["y_dense"]
+        cols = y_arr.shape[1]
+        out = np.zeros(cols, dtype=np.float64)
+        for c in range(cols):
+            out[c] = float(np.interp(t_clamped, t_arr, y_arr[:, c]))
+        return out
+
+    def _apply_csv_sample(self, t_csv: float):
+        """Evaluate and apply one interpolated CSV sample to kinematics, 3D view, and telemetry."""
+        vals = self._eval_csv_trajectory(t_csv)
+        mode = self.csv_trajectory["mode"]
+
+        if mode == "alpha_beta":
+            alpha_deg = float(vals[0])
+            beta_deg = float(np.clip(vals[1], 0.0, 90.0))
+
+            self.spin_alpha.blockSignals(True)
+            self.spin_beta.blockSignals(True)
+            self.slider_alpha.blockSignals(True)
+            self.slider_beta.blockSignals(True)
+
+            self.spin_alpha.setValue(alpha_deg)
+            self.slider_alpha.setValue(int(round(alpha_deg)))
+            self.spin_beta.setValue(beta_deg)
+            self.slider_beta.setValue(int(round(beta_deg * 10.0)))
+
+            self.spin_alpha.blockSignals(False)
+            self.spin_beta.blockSignals(False)
+            self.slider_alpha.blockSignals(False)
+            self.slider_beta.blockSignals(False)
+
+            q_mm, da, R = inverse_kinematics(
+                [alpha_deg, beta_deg],
+                rt=param_module.RT,
+                a0=param_module.ALPHA_0,
+                D=param_module.D,
+                deg=True,
+                clamp_hemisphere=True
+            )
+            self._apply_kinematics_result(q_mm, da, R)
+            return alpha_deg, beta_deg, da, q_mm
+        else:
+            # Direct actuator lengths L1..L6 (already in total anchor-to-anchor mm)
+            q_mm = np.asarray(vals[:6], dtype=np.float64)
+            try:
+                Y_deg, da, R = direct_kinematics(
+                    q_mm,
+                    da0=self.current_da,
+                    R0=self.current_R,
+                    Az=param_module.Az,
+                    Bz=param_module.Bz,
+                    D=param_module.D,
+                    rt=param_module.RT,
+                    a0=param_module.ALPHA_0,
+                    deg=True
+                )
+                alpha_deg = float(Y_deg[0])
+                beta_deg = float(np.clip(Y_deg[1], 0.0, 90.0))
+            except Exception:
+                da = self.current_da.copy()
+                R = self.current_R.copy()
+                alpha_deg = float(self.spin_alpha.value())
+                beta_deg = float(self.spin_beta.value())
+
+            self.spin_alpha.blockSignals(True)
+            self.spin_beta.blockSignals(True)
+            self.slider_alpha.blockSignals(True)
+            self.slider_beta.blockSignals(True)
+
+            self.spin_alpha.setValue(alpha_deg)
+            self.slider_alpha.setValue(int(round(alpha_deg)))
+            self.spin_beta.setValue(beta_deg)
+            self.slider_beta.setValue(int(round(beta_deg * 10.0)))
+
+            self.spin_alpha.blockSignals(False)
+            self.spin_beta.blockSignals(False)
+            self.slider_alpha.blockSignals(False)
+            self.slider_beta.blockSignals(False)
+
+            self._apply_kinematics_result(q_mm, da, R)
+            return alpha_deg, beta_deg, da, q_mm
+
     def _trajectory_tick(self):
-        """Execute one step of the 4-phase trajectory tracking sequence."""
-        if not self.is_tracking or self.traj_gen is None:
+        """Execute one step of the active trajectory tracking sequence (CSV or 4-phase generator)."""
+        if not self.is_tracking:
             return
 
         now = time.time()
@@ -920,20 +1066,73 @@ class MainWindow(QMainWindow):
 
         self.traj_elapsed += dt
         t = self.traj_elapsed
-        t_return_end = self.traj_cfg.t_tracking_end + self.traj_cfg.t_home_end
+
+        # Branch A: Smooth MATLAB CSV trajectory playback
+        if self.is_csv_playback and self.csv_trajectory is not None:
+            total_dur = max(float(self.traj_duration), 1e-6)
+            csv_dur = float(self.csv_trajectory["duration"])
+
+            if t >= total_dur:
+                # Apply final sample and finish cleanly
+                alpha_deg, beta_deg, da, _ = self._apply_csv_sample(csv_dur)
+                self.traj_timer.stop()
+                self.is_tracking = False
+                self.is_csv_playback = False
+                self.is_traj_paused = False
+                self.btn_start_track.setEnabled(True)
+                self.btn_pause_track.setText("⏸ PAUSA TRACK")
+                self.traj_progress.setValue(100)
+                self.badge_mode.set_status("CSV COMPLETADO", "green")
+                self.lbl_sb_pose.setText(
+                    f"[CSV FIN] t={total_dur:.2f}s / {total_dur:.2f}s | α: {alpha_deg:+.1f}° | β: {beta_deg:.1f}° | Z: {da[2]:.1f} mm"
+                )
+                self.log_message("[CSV] Reproducción de trayectoria CSV completada con éxito.")
+                return
+
+            t_csv = (t / total_dur) * csv_dur if csv_dur > 0.0 else 0.0
+            alpha_deg, beta_deg, da, _ = self._apply_csv_sample(t_csv)
+            pct = int(min(100, max(0, round((t / total_dur) * 100.0))))
+            self.traj_progress.setValue(pct)
+            self.badge_mode.set_status("TRAJ: CSV", "cyan")
+            self.lbl_sb_pose.setText(
+                f"[CSV] t={t:.2f}s / {total_dur:.1f}s | α: {alpha_deg:+.1f}° | β: {beta_deg:.1f}° | Z: {da[2]:.1f} mm"
+            )
+            return
+
+        # Branch B: Standard 4-phase TrajectoryGenerator
+        if self.traj_gen is None:
+            return
+
+        t_home_end = self.traj_cfg.t_home_end
+        t_track_end = self.traj_cfg.t_tracking_end
+        t_return_end = t_track_end + t_home_end
 
         if t >= t_return_end or self.traj_gen.phase == "done":
-            # Sequence complete: transition to HOME
+            # Sequence complete: transition to HOME (0 mm retracted)
             self.go_home()
             self.traj_progress.setValue(100)
-            self.log_message("[TRAJ] Secuencia completada con éxito: RETURN → HOME.")
+            self.log_message("[TRAJ] Secuencia completada con éxito: RETURN → HOME (actuadores en 0.0 mm).")
             return
 
         # Query authentic TrajectoryGenerator
         y_des, yp_des = self.traj_gen.step(t, dt=dt)
-        alpha_rad, beta_rad = float(y_des[0]), float(y_des[1])
+        alpha_rad = float(y_des[0])
+        beta_rad = float(np.clip(y_des[1], 0.0, np.pi / 2.0))
         alpha_deg = float(np.rad2deg(alpha_rad))
         beta_deg = float(np.rad2deg(beta_rad))
+
+        # Smooth transition between retracted HOME (rt_eff = 0 mm) and Hemisphere (rt_eff = RT)
+        rt_full = float(param_module.RT)
+        if self.traj_gen.phase == "home":
+            tau = float(np.clip(t / max(t_home_end, 1e-6), 0.0, 1.0))
+            s = tau * tau * (3.0 - 2.0 * tau)
+            rt_eff = s * rt_full
+        elif self.traj_gen.phase == "return":
+            tau = float(np.clip((t - t_track_end) / max(t_home_end, 1e-6), 0.0, 1.0))
+            s = tau * tau * (3.0 - 2.0 * tau)
+            rt_eff = (1.0 - s) * rt_full
+        else:
+            rt_eff = rt_full
 
         # Phase mapping: "home" -> APPROACH, "tracking" -> TRACK, "return" -> RETURN, "done" -> HOME
         phase_map = {"home": "APPROACH", "tracking": "TRACK", "return": "RETURN", "done": "HOME"}
@@ -956,15 +1155,22 @@ class MainWindow(QMainWindow):
         self.slider_alpha.blockSignals(False)
         self.slider_beta.blockSignals(False)
 
-        # Compute and dispatch kinematics
-        q_mm, da, R = inverse_kinematics([alpha_rad, beta_rad], rt=RT, a0=ALPHA_0, D=D, deg=False)
+        # Compute and dispatch kinematics on the hemisphere
+        q_mm, da, R = inverse_kinematics(
+            [alpha_rad, beta_rad],
+            rt=rt_eff,
+            a0=param_module.ALPHA_0,
+            D=param_module.D,
+            deg=False,
+            clamp_hemisphere=True
+        )
         self._apply_kinematics_result(q_mm, da, R)
 
         # Update progress bar
         pct = int(min(100, max(0, (t / t_return_end) * 100)))
         self.traj_progress.setValue(pct)
         self.lbl_sb_pose.setText(
-            f"[{phase_str}] t={t:.2f}s / {t_return_end:.1f}s | α: {alpha_deg:+.1f}° | β: {beta_deg:.1f}°"
+            f"[{phase_str}] t={t:.2f}s / {t_return_end:.1f}s | α: {alpha_deg:+.1f}° | β: {beta_deg:.1f}° | Z: {da[2]:.1f} mm"
         )
 
     def toggle_pause_trajectory(self):
@@ -975,7 +1181,10 @@ class MainWindow(QMainWindow):
         if not self.is_traj_paused:
             self.traj_timer.stop()
             self.is_traj_paused = True
-            self.hold_phase = self.traj_gen.phase if self.traj_gen else "HOLD"
+            if self.is_csv_playback:
+                self.hold_phase = "CSV"
+            else:
+                self.hold_phase = self.traj_gen.phase if self.traj_gen else "HOLD"
             self.btn_pause_track.setText("▶ REANUDAR")
             self.badge_mode.set_status(f"HOLD ({self.hold_phase.upper()})", "amber")
             self.log_message(f"[TRAJ] Pausa activada: plataforma en HOLD ({self.hold_phase.upper()}).")
@@ -992,6 +1201,7 @@ class MainWindow(QMainWindow):
         """Immediately stop trajectory tracking."""
         self.traj_timer.stop()
         self.is_tracking = False
+        self.is_csv_playback = False
         self.is_traj_paused = False
         self.btn_start_track.setEnabled(True)
         self.btn_pause_track.setText("⏸ PAUSA TRACK")
@@ -999,40 +1209,179 @@ class MainWindow(QMainWindow):
         self.badge_mode.set_status("TRACK (α/β)", "cyan")
         self.log_message("[TRAJ] Trayectoria detenida.")
 
-    def _load_custom_waypoints(self):
-        """Load external CSV file containing (time, alpha, beta) or (alpha, beta) columns."""
-        path, _ = QFileDialog.getOpenFileName(self, "Cargar Waypoints CSV", "", "CSV Files (*.csv);;All Files (*)")
+    def _parse_csv_file(self, path: str) -> dict:
+        """
+        Parse and smoothly interpolate a MATLAB-exported CSV trajectory file.
+        Supported formats:
+          1) time, alpha, beta                 (3 columns, angles in degrees)
+             or alpha, beta                    (2 columns, angles in degrees)
+          2) time, L1, L2, L3, L4, L5, L6      (7 columns, actuator lengths in mm or %)
+             or L1, L2, L3, L4, L5, L6         (6 columns, actuator lengths in mm or %)
+        """
+        import re as _re
+
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            raw_lines = [ln.strip() for ln in fh.readlines() if ln.strip() and not ln.strip().startswith(("#", "%"))]
+
+        if not raw_lines:
+            raise ValueError("El archivo CSV está vacío.")
+
+        header_text = ""
+        numeric_rows = []
+        for idx, ln in enumerate(raw_lines):
+            parts = [p.strip() for p in _re.split(r"[,;\t]+|\s+", ln) if p.strip()]
+            try:
+                row_vals = [float(p) for p in parts]
+                numeric_rows.append(row_vals)
+            except ValueError:
+                if idx == 0:
+                    header_text = ln.lower()
+                else:
+                    continue
+
+        if not numeric_rows:
+            raise ValueError("No se encontraron filas numéricas válidas en el CSV.")
+
+        data = np.asarray(numeric_rows, dtype=np.float64)
+        if data.ndim == 1:
+            data = data.reshape(1, -1)
+
+        ncols = data.shape[1]
+        default_dur = float(self.spin_traj_dur.value()) if hasattr(self, "spin_traj_dur") else 60.0
+
+        if ncols == 3:
+            t_raw = data[:, 0]
+            y_raw = data[:, 1:3]
+            mode = "alpha_beta"
+        elif ncols == 2:
+            t_raw = np.linspace(0.0, default_dur, len(data))
+            y_raw = data[:, 0:2]
+            mode = "alpha_beta"
+        elif ncols >= 7:
+            t_raw = data[:, 0]
+            L_raw = data[:, 1:7]
+            mode = "lengths"
+        elif ncols == 6:
+            t_raw = np.linspace(0.0, default_dur, len(data))
+            L_raw = data[:, 0:6]
+            mode = "lengths"
+        else:
+            raise ValueError(
+                f"Formato CSV no soportado ({ncols} columnas). "
+                "Formatos esperados: [time, alpha, beta] (3 cols) o [time, L1..L6] (7 cols)."
+            )
+
+        if mode == "lengths":
+            # Convert L1..L6 to total anchor-to-anchor length q_mm (mm):
+            # - If values are in [0, STROKE+40] (extension in mm or % stroke), convert to total length L0 + ext
+            # - If values are > STROKE+40 (already total anchor-to-anchor length in mm), use directly
+            if "%" in header_text or "pct" in header_text or "percent" in header_text:
+                y_raw = percent_to_length(L_raw, param_module.L0, param_module.STROKE)
+            elif np.max(L_raw) <= param_module.STROKE + 40.0:
+                y_raw = extension_to_q(L_raw, param_module.L0)
+            else:
+                y_raw = L_raw.copy()
+
+        # Normalize time vector to start at 0.0s and ensure strictly increasing timestamps
+        t_norm = np.asarray(t_raw, dtype=np.float64) - float(t_raw[0])
+        order = np.argsort(t_norm, kind="mergesort")
+        t_norm = t_norm[order]
+        y_raw = y_raw[order]
+
+        if len(t_norm) > 1:
+            unique_mask = np.concatenate([[True], np.diff(t_norm) > 1e-7])
+            t_norm = t_norm[unique_mask]
+            y_raw = y_raw[unique_mask]
+
+        if len(t_norm) == 1 or float(t_norm[-1]) <= 0.0:
+            t_norm = np.linspace(0.0, max(default_dur, 1.0), len(y_raw))
+
+        duration = float(t_norm[-1])
+
+        # Build smooth cubic spline interpolator (or dense linear table if < 3 points)
+        spline_obj = None
+        if len(t_norm) >= 3:
+            try:
+                spline_obj = SimpleCubicSpline(t_norm, y_raw, bc_type="natural")
+            except Exception:
+                spline_obj = None
+
+        n_dense = int(min(20000, max(1000, len(t_norm) * 10)))
+        t_dense = np.linspace(0.0, duration, n_dense)
+        if spline_obj is not None:
+            y_dense = np.asarray(spline_obj(t_dense), dtype=np.float64)
+        else:
+            y_dense = np.zeros((n_dense, y_raw.shape[1]), dtype=np.float64)
+            for c in range(y_raw.shape[1]):
+                y_dense[:, c] = np.interp(t_dense, t_norm, y_raw[:, c])
+
+        return {
+            "path": path,
+            "mode": mode,
+            "t": t_norm,
+            "y": y_raw,
+            "t_dense": t_dense,
+            "y_dense": y_dense,
+            "spline": spline_obj,
+            "duration": duration,
+            "num_points": len(data),
+        }
+
+    def _load_custom_waypoints(self, path: Optional[str] = None):
+        """
+        Load external MATLAB CSV file containing either:
+          - time, alpha, beta (in degrees)
+          - time, L1, L2, L3, L4, L5, L6 (lengths in mm or %)
+        Interpolates smoothly and prepares continuous trajectory playback.
+        """
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(
+                self, "Cargar Trayectoria CSV (MATLAB)", "", "CSV Files (*.csv);;All Files (*)"
+            )
         if not path:
             return
         try:
-            data = np.loadtxt(path, delimiter=",", skiprows=1)
-            if data.ndim == 1:
-                data = data.reshape(1, -1)
-            if data.shape[1] == 2:
-                pts = data[:, :2]
-            elif data.shape[1] >= 3:
-                pts = data[:, 1:3]
-            else:
-                raise ValueError("El archivo debe contener al menos 2 columnas: [alpha, beta] o 3: [tiempo, alpha, beta].")
+            csv_traj = self._parse_csv_file(path)
+            self.csv_trajectory = csv_traj
 
-            if len(pts) >= 3:
-                indices = [0, len(pts) // 2, -1]
-                self.custom_traj_points = [pts[i].tolist() for i in indices]
-            elif len(pts) == 1:
-                self.custom_traj_points = [pts[0].tolist(), pts[0].tolist(), pts[0].tolist()]
-            else:
-                self.custom_traj_points = [pts[0].tolist(), pts[1].tolist(), pts[1].tolist()]
+            # Also keep 3 representative waypoints for compatibility if needed
+            if csv_traj["mode"] == "alpha_beta":
+                pts = csv_traj["y"]
+                if len(pts) >= 3:
+                    indices = [0, len(pts) // 2, -1]
+                    self.custom_traj_points = [pts[i].tolist() for i in indices]
+                elif len(pts) == 1:
+                    self.custom_traj_points = [pts[0].tolist()] * 3
+                else:
+                    self.custom_traj_points = [pts[0].tolist(), pts[1].tolist(), pts[1].tolist()]
 
             self.combo_traj_pattern.setCurrentText("Waypoints Personalizados (CSV)")
-            self.log_message(f"[TRAJ] Waypoints cargados exitosamente desde {path} ({len(pts)} puntos).")
+
+            # Sync spin_traj_dur with CSV duration if positive
+            if csv_traj["duration"] > 0.0:
+                clamped_dur = float(
+                    np.clip(csv_traj["duration"], self.spin_traj_dur.minimum(), self.spin_traj_dur.maximum())
+                )
+                self.spin_traj_dur.setValue(clamped_dur)
+
+            # Preview initial point (t = 0) on the 3D view and telemetry
+            self._apply_csv_sample(0.0)
+            self.traj_progress.setValue(0)
+
+            mode_desc = "time, alpha, beta (°)" if csv_traj["mode"] == "alpha_beta" else "time, L1..L6 (mm/%)"
+            self.log_message(
+                f"[CSV] Trayectoria cargada e interpolada desde '{path}': "
+                f"formato [{mode_desc}], {csv_traj['num_points']} puntos, "
+                f"duración={csv_traj['duration']:.2f}s. Presione '▶ INICIAR TRACKING' para reproducir."
+            )
         except Exception as e:
-            QMessageBox.critical(self, "Error de Waypoints", f"No se pudo cargar el archivo:\n{e}")
+            QMessageBox.critical(self, "Error Cargando CSV", f"No se pudo cargar el archivo CSV:\n{e}")
 
     # =========================================================================
     # GLOBAL CONTROLS: HOME, PAUSE, ESTOP, CALIBRATION
     # =========================================================================
     def go_home(self):
-        """Return platform to nominal home pose (Zenith: alpha=0, beta=90°, stroke 0%)."""
+        """Return platform to nominal home pose (Zenith: alpha=0, beta=90°, all actuators retracted at 0.0 mm / 0%)."""
         self.abort_trajectory()
         self._reset_cartesian_zero()
 
@@ -1055,15 +1404,17 @@ class MainWindow(QMainWindow):
         if hasattr(self, 'traj_gen') and self.traj_gen:
             self.traj_gen.reset()
 
-        # Compute Home kinematics at Zenith (alpha=0, beta=pi/2)
-        q_mm, da, R = inverse_kinematics([0.0, np.pi / 2], rt=RT, a0=ALPHA_0, D=D, deg=False)
+        # Compute retracted HOME kinematics: da = D, R = I_3, q_mm = L0 => extension q_ef = 0.0 mm (0%)
+        q_mm, da, R = home_kinematics(D=param_module.D, Az=param_module.Az, Bz=param_module.Bz)
         self._apply_kinematics_result(q_mm, da, R)
 
         # Send home command via serial
         self.serial_manager.home()
-        self.badge_mode.set_status("HOME (CENIT)", "cyan")
-        self.lbl_sb_pose.setText(f"HOME (Cenit): α: 0.0° | β: 90.0° | Z: {D[2]:.1f} mm")
-        self.log_message("[HOME] Retornado a posición segura nominal (Cenit, carrera 0%).")
+        self.badge_mode.set_status("HOME (0 mm)", "cyan")
+        self.lbl_sb_pose.setText(
+            f"HOME (Retraído 0.0 mm / 0%): α: 0.0° | β: 90.0° | Z: {da[2]:.2f} mm"
+        )
+        self.log_message("[HOME] Posición HOME alcanzada: todos los actuadores retraídos en 0.0 mm (0%).")
 
     def toggle_pause(self):
         """Global pause."""
@@ -1111,28 +1462,62 @@ class MainWindow(QMainWindow):
         dialog.parameters_changed.connect(self._on_parameters_changed)
         dialog.exec()
 
-    def _on_parameters_changed(self, params: dict):
-        """Handle system parameters update and refresh kinematics/views."""
-        self.log_message("[CONFIG] Nuevos parámetros del sistema aplicados y guardados.")
+    def _sync_runtime_parameters(self, params: dict):
+        """Synchronize config.parameters module attributes with loaded parameter dictionary."""
+        if not isinstance(params, dict):
+            return
         if "L0" in params:
             param_module.L0 = float(params["L0"])
         if "STROKE" in params:
             param_module.STROKE = float(params["STROKE"])
+        param_module.ACTUATOR_MIN = param_module.L0
+        param_module.ACTUATOR_MAX = param_module.L0 + param_module.STROKE
+        param_module.Q_MIN = param_module.ACTUATOR_MIN
+        param_module.Q_MAX = param_module.ACTUATOR_MAX
+        param_module.Q_NOMINAL = param_module.ACTUATOR_MIN
+        param_module.Q_SAFE_MIN = param_module.Q_MIN + param_module.SAFE_MARGIN
+        param_module.Q_SAFE_MAX = param_module.Q_MAX - param_module.SAFE_MARGIN
+
         if "RT" in params:
             param_module.RT = float(params["RT"])
         if "ALPHA_0" in params:
             param_module.ALPHA_0 = float(params["ALPHA_0"])
         if "D" in params:
             param_module.D = np.array(params["D"], dtype=np.float64)
-            self.current_da = param_module.D.copy()
+            param_module.Z_HOME = float(param_module.D[2])
         if "Az" in params:
             param_module.Az = np.array(params["Az"], dtype=np.float64)
-            self.gl_view.platform_joints = param_module.Az.copy()
+            param_module.PLATFORM_JOINTS = param_module.Az
         if "Bz" in params:
             param_module.Bz = np.array(params["Bz"], dtype=np.float64)
-            self.gl_view.base_joints = param_module.Bz.copy()
+            param_module.BASE_JOINTS = param_module.Bz
+        if "ALPHA_PI" in params:
+            param_module.ALPHA_PI = float(params["ALPHA_PI"])
+        if "KP_S" in params:
+            param_module.KP_S = float(params["KP_S"])
+        if "KI_S" in params:
+            param_module.KI_S = float(params["KI_S"])
+        if "T_HOME_END" in params:
+            param_module.T_HOME_END = float(params["T_HOME_END"])
+        if "T_TRACKING_END" in params:
+            param_module.T_TRACKING_END = float(params["T_TRACKING_END"])
+        if "DEMO_DURATION" in params:
+            param_module.DEMO_DURATION = float(params["DEMO_DURATION"])
+        if "DT" in params:
+            param_module.DT = float(params["DT"])
+        if "FILTER_WN" in params:
+            param_module.FILTER_WN = float(params["FILTER_WN"])
         if "TRAJ_POINTS" in params:
-            self.current_traj_points = [list(pt) for pt in params["TRAJ_POINTS"]]
+            param_module.TRAJ_POINTS = [list(pt) for pt in params["TRAJ_POINTS"]]
+
+    def _on_parameters_changed(self, params: dict):
+        """Handle system parameters update and refresh kinematics/views."""
+        self.log_message("[CONFIG] Nuevos parámetros del sistema aplicados y guardados.")
+        self._sync_runtime_parameters(params)
+        self.current_da = param_module.D.copy()
+        self.gl_view.platform_joints = param_module.Az.copy()
+        self.gl_view.base_joints = param_module.Bz.copy()
+        self.current_traj_points = [list(pt) for pt in param_module.TRAJ_POINTS]
 
         # Re-evaluate kinematics to reflect updated geometry
         if self.control_mode == "CARTESIAN":

@@ -11,7 +11,7 @@ Wraps authentic functions from kinematics package:
 import numpy as np
 
 # Import authentic kinematics from kinematics package
-from kinematics.inverse import inverse_kinematics as _raw_ik, TIK, PIK
+from kinematics.inverse import inverse_kinematics as _raw_ik, TIK, PIK, home_kinematics
 from kinematics.direct import (
     direct_kinematics as _raw_dk, CA, TSDK, TSVK, PDK, R_to_rpy
 )
@@ -19,13 +19,17 @@ from kinematics.pose import pose_to_q as _raw_pose_to_q, rpy_to_R
 from kinematics.jacobian import InvJac as _raw_inv_jac
 from logic.spline import SimpleCubicSpline
 
-from config.parameters import Az, Bz, D, RT, ALPHA_0, L0, STROKE, length_to_percent
+import config.parameters as _params
+from config.parameters import (
+    Az, Bz, D, RT, ALPHA_0, L0, STROKE,
+    length_to_percent, percent_to_length, q_to_extension, extension_to_q
+)
 
 
 def pose_to_q(x: float, y: float, z: float, roll: float, pitch: float, yaw: float, deg: bool = True):
     """
     Calculates actuator lengths for Cartesian pose.
-    x, y, z in mm.
+    x, y, z in mm (offset relative to D; at 0,0,0 and 0,0,0 deg all actuators are at HOME = 0 mm extension).
     roll, pitch, yaw in degrees (if deg=True) or radians.
     """
     r = np.deg2rad(roll) if deg else float(roll)
@@ -34,11 +38,11 @@ def pose_to_q(x: float, y: float, z: float, roll: float, pitch: float, yaw: floa
     return _raw_pose_to_q(x, y, z, r, p, yw)
 
 
-def inverse_kinematics(y, rt=RT, a0=ALPHA_0, D=D, deg: bool = True):
+def inverse_kinematics(y, rt=None, a0=None, D=None, deg: bool = True, clamp_hemisphere: bool = True):
     """
-    Inverse kinematics for task space [alpha, beta].
+    Inverse kinematics for task space [alpha, beta] on the hemisphere of radius rt.
     alpha: azimuth angle.
-    beta: elevation from horizon (90° = zenith/home).
+    beta: elevation from horizon (0°..90°, where 90° = zenith).
     If deg=True, inputs are converted to radians.
     """
     y_arr = np.asarray(y, dtype=float)
@@ -46,18 +50,24 @@ def inverse_kinematics(y, rt=RT, a0=ALPHA_0, D=D, deg: bool = True):
         y_rad = np.deg2rad(y_arr[:2])
     else:
         y_rad = y_arr[:2]
-    return _raw_ik(y_rad, rt=rt, a0=a0, D=D)
+    return _raw_ik(y_rad, rt=rt, a0=a0, D=D, clamp_hemisphere=clamp_hemisphere)
 
 
 def direct_kinematics(
-    q, qp=None, da0=None, R0=None, Az=Az, Bz=Bz, D=D, rt=RT, a0=ALPHA_0, deg: bool = True
+    q, qp=None, da0=None, R0=None, Az=None, Bz=None, D=None, rt=None, a0=None, deg: bool = True
 ):
     """
     Direct kinematics from actuator lengths q (and optional velocities qp).
     Returns task-space angles Y=[alpha, beta] (in degrees if deg=True, else radians),
     along with (da, R) or (Yp, da, R, Va, Omega).
     """
-    res = _raw_dk(q, qp=qp, da0=da0, R0=R0, Az=Az, Bz=Bz, D=D, rt=rt, a0=a0)
+    az_use = _params.Az if Az is None else Az
+    bz_use = _params.Bz if Bz is None else Bz
+    d_use = _params.D if D is None else D
+    rt_use = _params.RT if rt is None else rt
+    a0_use = _params.ALPHA_0 if a0 is None else a0
+
+    res = _raw_dk(q, qp=qp, da0=da0, R0=R0, Az=az_use, Bz=bz_use, D=d_use, rt=rt_use, a0=a0_use)
     if qp is None:
         Y_rad, da, R = res
         Y_out = np.rad2deg(Y_rad) if deg else Y_rad
@@ -69,11 +79,13 @@ def direct_kinematics(
         return Y_out, Yp_out, da, R, Va, Omega
 
 
-def InvJac(da: np.ndarray, R: np.ndarray, Az=Az, Bz=Bz):
+def InvJac(da: np.ndarray, R: np.ndarray, Az=None, Bz=None):
     """
     Calculates the 6x6 Inverse Jacobian matrix.
     """
-    res = _raw_inv_jac(da, R, Az=Az, Bz=Bz)
+    az_use = _params.Az if Az is None else Az
+    bz_use = _params.Bz if Bz is None else Bz
+    res = _raw_inv_jac(da, R, Az=az_use, Bz=bz_use)
     if isinstance(res, tuple):
         return res[0]  # Return 6x6 matrix A
     return res

@@ -13,7 +13,8 @@ from PySide6.QtCore import Qt
 
 import pyqtgraph.opengl as gl
 
-from config.parameters import BASE_JOINTS, PLATFORM_JOINTS, Z_HOME, Q_MIN, Q_MAX, Q_SAFE_MIN, Q_SAFE_MAX
+import config.parameters as _params
+from config.parameters import BASE_JOINTS, PLATFORM_JOINTS, Z_HOME, Q_MIN, Q_MAX, Q_SAFE_MIN, Q_SAFE_MAX, SAFE_MARGIN
 from ui.styles import (
     COLOR_CARD_BG, COLOR_BORDER, COLOR_CYAN, COLOR_EMERALD,
     COLOR_EMERGENCY, COLOR_WARNING, COLOR_TEXT_MUTED
@@ -216,17 +217,20 @@ class Platform3DView(QWidget):
         normal_vec = R @ np.array([0.0, 0.0, 90.0])
         self.normal_ray.setData(pos=np.vstack([da, da + normal_vec]))
 
-        # Update 6 Actuator lines with dynamic safety color coding
+        # Update 6 Actuator lines with dynamic safety color coding based on extension [0, STROKE] mm
+        l0 = float(_params.L0)
+        stroke = float(_params.STROKE)
         for i in range(6):
             pts = np.vstack([self.base_joints[i], ai[i]])
-            qi = q_arr[i] if i < len(q_arr) else 332.0
+            qi = float(q_arr[i]) if i < len(q_arr) else l0
+            ext_i = qi - l0 if qi > stroke + 40.0 else qi
 
-            # Dynamic color based on mechanical extension limits
-            if qi < Q_MIN or qi > Q_MAX:
-                color = (0.9, 0.1, 0.1, 1.0)  # Red warning
-            elif qi < Q_SAFE_MIN or qi > Q_SAFE_MAX:
-                color = (1.0, 0.7, 0.0, 1.0)  # Amber warning
+            # Dynamic color based on mechanical extension limits (HOME = 0.0 mm is optimal cyan)
+            if ext_i < -0.5 or ext_i > stroke + 0.5:
+                color = (0.9, 0.1, 0.1, 1.0)  # Red warning (limit exceeded)
+            elif ext_i > stroke - SAFE_MARGIN:
+                color = (1.0, 0.7, 0.0, 1.0)  # Amber warning (near max stroke)
             else:
-                color = (0.0, 0.9, 1.0, 0.95)  # Cyan optimal
+                color = (0.0, 0.9, 1.0, 0.95)  # Cyan optimal (includes HOME = 0 mm)
 
             self.actuator_lines[i].setData(pos=pts, color=color)

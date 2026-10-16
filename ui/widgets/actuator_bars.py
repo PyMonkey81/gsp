@@ -10,7 +10,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt
 
-from config.parameters import Q_MIN, Q_MAX, Q_NOMINAL, Q_SAFE_MIN, Q_SAFE_MAX
+import config.parameters as _params
+from config.parameters import SAFE_MARGIN
 from ui.styles import (
     COLOR_CARD_BG, COLOR_BORDER, COLOR_CYAN, COLOR_EMERALD,
     COLOR_EMERGENCY, COLOR_WARNING, COLOR_TEXT_PRIMARY,
@@ -21,9 +22,9 @@ from ui.styles import (
 class SingleActuatorBar(QFrame):
     """
     Compact individual Actuator Level card with single-row header:
-    [ L1 ]  [ 331.7 mm ]  [ Δ +0.0 mm ]                 [ SEGURO ]
+    [ L1 ]  [ 0.0 mm ]  [ 0.0% | L: 247.4 mm ]             [ HOME (0 mm) ]
     [=====================|======================================]
-    220 mm                  332 mm                         420 mm
+    HOME: 0 mm             50 mm                         MAX: 100 mm
     """
     def __init__(self, index: int, parent=None):
         super().__init__(parent)
@@ -41,7 +42,7 @@ class SingleActuatorBar(QFrame):
         layout.setContentsMargins(6, 4, 6, 4)
         layout.setSpacing(3)
 
-        # 1. Compact Header Row: L{i} + Value + Delta + Status aligned right
+        # 1. Compact Header Row: L{i} + Extension (0..100 mm) + % / Total Length + Status aligned right
         hdr_layout = QHBoxLayout()
         hdr_layout.setContentsMargins(0, 0, 0, 0)
         hdr_layout.setSpacing(8)
@@ -51,8 +52,8 @@ class SingleActuatorBar(QFrame):
         self.lbl_id.setStyleSheet(f"font-weight: 800; font-size: 13px; color: {COLOR_CYAN};")
         hdr_layout.addWidget(self.lbl_id)
 
-        # Live Length Readout (immediately right of L{i})
-        self.lbl_val = QLabel(f"{Q_NOMINAL:.1f} mm")
+        # Live Extension Readout (0.0 mm at HOME when fully retracted)
+        self.lbl_val = QLabel("0.0 mm")
         self.lbl_val.setStyleSheet(f"""
             font-family: {FONT_MONO};
             font-size: 13px;
@@ -61,8 +62,8 @@ class SingleActuatorBar(QFrame):
         """)
         hdr_layout.addWidget(self.lbl_val)
 
-        # Delta from nominal position
-        self.lbl_delta = QLabel("Δ +0.0 mm")
+        # Stroke percentage and total anchor-to-anchor length
+        self.lbl_delta = QLabel(f"0.0% (L: {_params.L0:.1f} mm)")
         self.lbl_delta.setStyleSheet(f"""
             font-family: {FONT_MONO};
             font-size: 10px;
@@ -73,36 +74,37 @@ class SingleActuatorBar(QFrame):
         hdr_layout.addStretch()
 
         # Safety State (aligned to far right)
-        self.lbl_status = QLabel("SEGURO")
+        self.lbl_status = QLabel("HOME (0 mm)")
         self.lbl_status.setStyleSheet(f"font-weight: 700; font-size: 10px; color: {COLOR_EMERALD};")
         hdr_layout.addWidget(self.lbl_status)
 
         layout.addLayout(hdr_layout)
 
-        # 2. Progress / Level Bar
+        # 2. Progress / Level Bar (0.0 mm to STROKE mm in tenths of mm)
+        stroke = float(_params.STROKE)
         self.bar = QProgressBar()
-        self.bar.setRange(int(Q_MIN * 10), int(Q_MAX * 10))
-        self.bar.setValue(int(Q_NOMINAL * 10))
+        self.bar.setRange(0, int(stroke * 10))
+        self.bar.setValue(0)
         self.bar.setTextVisible(False)
         self.bar.setFixedHeight(8)
         self._set_bar_color(COLOR_CYAN)
         layout.addWidget(self.bar)
 
-        # 3. Numeric Limit Indicators (Min, Nom, Max)
+        # 3. Numeric Limit Indicators (HOME: 0 mm, Mid, MAX: STROKE mm)
         lim_layout = QHBoxLayout()
         lim_layout.setContentsMargins(0, 0, 0, 0)
-        lbl_min = QLabel(f"{Q_MIN:.0f} mm")
-        lbl_nom = QLabel(f"Nom: {Q_NOMINAL:.0f} mm")
-        lbl_max = QLabel(f"{Q_MAX:.0f} mm")
+        self.lbl_min = QLabel("HOME: 0 mm")
+        self.lbl_nom = QLabel(f"Media: {stroke * 0.5:.0f} mm")
+        self.lbl_max = QLabel(f"MAX: {stroke:.0f} mm")
         
-        for l in (lbl_min, lbl_nom, lbl_max):
+        for l in (self.lbl_min, self.lbl_nom, self.lbl_max):
             l.setStyleSheet(f"font-size: 9px; color: {COLOR_TEXT_MUTED}; font-family: {FONT_MONO};")
             
-        lim_layout.addWidget(lbl_min)
+        lim_layout.addWidget(self.lbl_min)
         lim_layout.addStretch()
-        lim_layout.addWidget(lbl_nom)
+        lim_layout.addWidget(self.lbl_nom)
         lim_layout.addStretch()
-        lim_layout.addWidget(lbl_max)
+        lim_layout.addWidget(self.lbl_max)
         layout.addLayout(lim_layout)
 
     def _set_bar_color(self, hex_color: str):
@@ -119,27 +121,60 @@ class SingleActuatorBar(QFrame):
         """)
 
     def update_length(self, q_val: float):
-        """Update live readouts, progress bar, and safety classification."""
-        self.lbl_val.setText(f"{q_val:.1f} mm")
-        delta = q_val - Q_NOMINAL
-        sign = "+" if delta >= 0 else ""
-        self.lbl_delta.setText(f"Δ {sign}{delta:.1f} mm")
+        """
+        Update live readouts, progress bar, and safety classification.
+        Accepts either total anchor-to-anchor length q_mm (e.g. ~247.41..347.41 mm)
+        or effective extension q_ef = q_mm - L0 (0.0..100.0 mm).
+        At HOME (retracted), extension is 0.0 mm (0.0%).
+        """
+        l0 = float(_params.L0)
+        stroke = float(_params.STROKE)
+
+        # Distinguish total anchor-to-anchor length vs direct extension
+        if q_val > stroke + 40.0:
+            total_mm = float(q_val)
+            ext_mm = total_mm - l0
+        else:
+            ext_mm = float(q_val)
+            total_mm = l0 + ext_mm
+
+        # Snap tiny floating-point noise around 0.0 mm
+        if abs(ext_mm) < 0.05:
+            ext_mm = 0.0
+
+        pct = np.clip((ext_mm / max(stroke, 1e-6)) * 100.0, 0.0, 100.0)
+
+        self.lbl_val.setText(f"{ext_mm:.1f} mm")
+        self.lbl_delta.setText(f"{pct:.1f}% (L: {total_mm:.1f} mm)")
+
+        # Update range if STROKE was modified dynamically
+        max_bar = max(10, int(stroke * 10))
+        if self.bar.maximum() != max_bar:
+            self.bar.setRange(0, max_bar)
+            self.lbl_nom.setText(f"Media: {stroke * 0.5:.0f} mm")
+            self.lbl_max.setText(f"MAX: {stroke:.0f} mm")
 
         # Clamp bar display value
-        int_val = int(np.clip(q_val * 10, Q_MIN * 10, Q_MAX * 10))
+        int_val = int(np.clip(round(ext_mm * 10.0), 0, max_bar))
         self.bar.setValue(int_val)
 
-        # Safety boundary evaluation
-        if q_val < Q_MIN or q_val > Q_MAX:
+        # Safety boundary evaluation in extension space [0, STROKE] mm
+        tol = 0.5
+        if ext_mm < -tol or ext_mm > stroke + tol:
             self._set_bar_color(COLOR_EMERGENCY)
             self.lbl_status.setText("LÍMITE EXCEDIDO")
             self.lbl_status.setStyleSheet(f"font-weight: 700; font-size: 10px; color: {COLOR_EMERGENCY};")
             self.lbl_val.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 13px; font-weight: 700; color: {COLOR_EMERGENCY};")
-        elif q_val < Q_SAFE_MIN or q_val > Q_SAFE_MAX:
+        elif ext_mm > stroke - SAFE_MARGIN:
             self._set_bar_color(COLOR_WARNING)
             self.lbl_status.setText("CERCA DE LÍMITE")
             self.lbl_status.setStyleSheet(f"font-weight: 700; font-size: 10px; color: {COLOR_WARNING};")
             self.lbl_val.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 13px; font-weight: 700; color: {COLOR_WARNING};")
+        elif abs(ext_mm) <= 0.15:
+            self._set_bar_color(COLOR_CYAN)
+            self.lbl_status.setText("HOME (0 mm)")
+            self.lbl_status.setStyleSheet(f"font-weight: 700; font-size: 10px; color: {COLOR_EMERALD};")
+            self.lbl_val.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 13px; font-weight: 700; color: {COLOR_TEXT_PRIMARY};")
         else:
             self._set_bar_color(COLOR_CYAN)
             self.lbl_status.setText("SEGURO")

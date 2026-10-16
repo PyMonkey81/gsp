@@ -11,6 +11,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer
 import pyqtgraph as pg
 
+import config.parameters as _params
+from control.sliding_pi import SlidingPIController
 from ui.styles import (
     COLOR_CARD_BG, COLOR_BORDER, COLOR_CYAN, COLOR_EMERALD,
     COLOR_WARNING, COLOR_TEXT_PRIMARY, COLOR_TEXT_MUTED
@@ -29,13 +31,22 @@ ACTUATOR_COLORS = [
 
 class TelemetryPlotWidget(QWidget):
     """
-    High-performance real-time oscilloscope plotting actuator lengths, tracking errors, or control efforts.
+    High-performance real-time oscilloscope plotting actuator extensions (0..100 mm),
+    tracking errors, or Sliding-PI control efforts matching Simulink (system_3689.xml).
     """
     def __init__(self, buffer_size: int = 250, parent=None):
         super().__init__(parent)
         self.buffer_size = buffer_size
-        self._target_q = np.array([332.0] * 6, dtype=np.float64)
-        self._actual_q = np.array([332.0] * 6, dtype=np.float64)
+        self._target_q = np.zeros(6, dtype=np.float64)
+        self._actual_q = np.zeros(6, dtype=np.float64)
+        self._prev_target_q = np.zeros(6, dtype=np.float64)
+        self._prev_actual_q = np.zeros(6, dtype=np.float64)
+        self._sliding_pi = SlidingPIController(
+            alpha=_params.ALPHA_PI,
+            kp=_params.KP_S,
+            ki=_params.KI_S,
+            dt=1.0 / max(_params.TELEMETRY_REFRESH_HZ, 1)
+        )
 
         # Ring buffers for history: time index, and 6 actuator values
         self.history_len = buffer_size
@@ -62,9 +73,9 @@ class TelemetryPlotWidget(QWidget):
 
         self.combo_mode = QComboBox()
         self.combo_mode.addItems([
-            "Longitudes Actuales (mm)",
+            "Extensión Actuadores q_ef (0-100 mm)",
             "Error de Seguimiento e_i (mm)",
-            "Esfuerzo Estimado Sliding-PI"
+            "Esfuerzo Control Sliding-PI (τ)"
         ])
         self.combo_mode.setFixedHeight(22)
         ctrl_layout.addWidget(self.combo_mode)
@@ -86,7 +97,7 @@ class TelemetryPlotWidget(QWidget):
         self.plot_widget = pg.PlotWidget()
         self.plot_widget.setBackground("#0E1318")
         self.plot_widget.showGrid(x=True, y=True, alpha=0.25)
-        self.plot_widget.setLabel("left", "Magnitud", units="mm", color="#90A4AE")
+        self.plot_widget.setLabel("left", "Extensión", units="mm", color="#90A4AE")
         self.plot_widget.setLabel("bottom", "Muestras", color="#90A4AE")
 
         # Create 6 curves with legend
@@ -108,24 +119,51 @@ class TelemetryPlotWidget(QWidget):
         self.render_timer.timeout.connect(self._render_curves)
         self.render_timer.start()
 
+    @staticmethod
+    def _to_ext(q_arr: np.ndarray) -> np.ndarray:
+        """Convert anchor-to-anchor length (mm) to effective extension q_ef = q - L0 (0 mm at HOME)."""
+        arr = np.asarray(q_arr, dtype=np.float64)
+        l0 = float(_params.L0)
+        stroke = float(_params.STROKE)
+        if np.max(arr) > stroke + 40.0:
+            ext = arr - l0
+        else:
+            ext = arr.copy()
+        ext[np.abs(ext) < 0.05] = 0.0
+        return ext
+
     def update_telemetry(self, target_q: Union[list, np.ndarray], actual_q: Union[list, np.ndarray]):
         """
-        Ingest new telemetry sample.
+        Ingest new telemetry sample (in extension mm, where HOME = 0.0 mm).
         """
-        self._target_q = np.asarray(target_q, dtype=np.float64)
-        self._actual_q = np.asarray(actual_q, dtype=np.float64)
+        dt = 1.0 / max(_params.TELEMETRY_REFRESH_HZ, 1)
+        new_target = self._to_ext(target_q)
+        new_actual = self._to_ext(actual_q)
+
+        qd_dot = (new_target - self._prev_target_q) / dt if self._sample_counter > 0 else np.zeros(6)
+        q_dot = (new_actual - self._prev_actual_q) / dt if self._sample_counter > 0 else np.zeros(6)
+
+        self._prev_target_q = new_target.copy()
+        self._prev_actual_q = new_actual.copy()
+        self._target_q = new_target
+        self._actual_q = new_actual
+
+        # Keep controller gains synced with config.parameters
+        self._sliding_pi.alpha = float(_params.ALPHA_PI)
+        self._sliding_pi.kp = float(_params.KP_S)
+        self._sliding_pi.ki = float(_params.KI_S)
+        tau = self._sliding_pi.compute(self._actual_q, self._target_q, q_dot, qd_dot, dt=dt)
 
         mode_idx = self.combo_mode.currentIndex()
         if mode_idx == 0:
-            # Actual lengths
+            # Effective actuator extension (0.0 mm at HOME to 100.0 mm at full stroke)
             vals = self._actual_q
         elif mode_idx == 1:
-            # Tracking error e_i = target - actual
+            # Tracking error Δq = q - q_d (or e_i = q_d - q) in mm
             vals = self._target_q - self._actual_q
         else:
-            # Control effort proxy: sliding surface s = e_dot + lambda * e
-            e = self._target_q - self._actual_q
-            vals = np.tanh(e * 0.4) * 100.0  # Normalized % control signal
+            # Authentic Simulink Sliding-PI control effort τ = -Kp*S - Ki*∫S dt
+            vals = tau
 
         self._sample_counter += 1
         self.time_buffer.append(self._sample_counter)
@@ -151,3 +189,4 @@ class TelemetryPlotWidget(QWidget):
             b.clear()
         for c in self.curves:
             c.clear()
+        self._sliding_pi.reset()
