@@ -20,12 +20,15 @@ from config.parameters import (
     Z_HOME, Q_MIN, Q_MAX, Q_NOMINAL,
     LIMITS_X, LIMITS_Y, LIMITS_Z, LIMITS_ROLL, LIMITS_PITCH, LIMITS_YAW,
     LIMITS_ALPHA, LIMITS_BETA, AVAILABLE_BAUDRATES, DEFAULT_BAUDRATE,
-    BASE_JOINTS, PLATFORM_JOINTS
+    BASE_JOINTS, PLATFORM_JOINTS, Az, Bz, D, RT, ALPHA_0, L0, STROKE,
+    T_HOME_END, T_TRACKING_END, DT, FILTER_WN, DEMO_DURATION, TRAJ_POINTS,
+    length_to_percent, percent_to_length
 )
 from core.kinematics import (
     pose_to_q, inverse_kinematics, InvJac, calculate_singularity_metrics, SimpleCubicSpline
 )
-from core.serial_manager import SerialManager
+from trajectory.generator import TrajectoryConfig, TrajectoryGenerator
+from connection.serial_manager import SerialManager
 from ui.styles import (
     COLOR_CYAN, COLOR_EMERALD, COLOR_EMERGENCY, COLOR_WARNING,
     COLOR_BORDER, COLOR_CARD_BG, COLOR_PANEL_BG, FONT_MONO
@@ -47,26 +50,39 @@ class MainWindow(QMainWindow):
         self.resize(1440, 920)
         self.setMinimumSize(1100, 720)
 
-        # Initialize Serial Communication Manager (Asynchronous worker in QThread)
-        self.serial_manager = SerialManager()
+        # Initialize Serial Communication Manager
+        self.serial_manager = SerialManager(self)
 
         # State Variables
-        self.current_da = np.array([0.0, 0.0, Z_HOME], dtype=np.float64)
+        self.current_da = D.copy()
         self.current_R = np.eye(3, dtype=np.float64)
         self.current_q = np.array([Q_NOMINAL] * 6, dtype=np.float64)
+        self.current_pct = np.zeros(6, dtype=np.float64)
         self.actual_q = np.array([Q_NOMINAL] * 6, dtype=np.float64)
         self.control_mode = "CARTESIAN"  # 'CARTESIAN', 'TRACK', or 'IDLE'
 
-        # Trajectory Tracking State
-        self.trajectory_spline: Optional[SimpleCubicSpline] = None
+        # Trajectory Tracking Engine using authentic TrajectoryGenerator
+        self.traj_cfg = TrajectoryConfig(
+            t_home_end=T_HOME_END,
+            t_tracking_end=T_TRACKING_END,
+            dt=DT,
+            filter_wn=FILTER_WN
+        )
+        self.traj_gen = TrajectoryGenerator(self.traj_cfg)
+        self.current_traj_points = [list(pt) for pt in TRAJ_POINTS]
+        self.traj_gen.set_tracking_points(np.radians(self.current_traj_points))
+
         self.traj_timer = QTimer(self)
         self.traj_timer.setInterval(33)  # ~30 Hz execution loop
         self.traj_start_time = 0.0
         self.traj_pause_time = 0.0
         self.traj_elapsed = 0.0
-        self.traj_duration = 10.0
+        self.traj_duration = DEMO_DURATION
         self.is_tracking = False
         self.is_traj_paused = False
+        self.hold_phase = None
+        self.last_tick_time = 0.0
+        self.custom_traj_points = None
 
         # Build UI Structure
         self._setup_ui()
@@ -247,7 +263,7 @@ class MainWindow(QMainWindow):
         pos_configs = [
             ("X", LIMITS_X[0], LIMITS_X[1], 0.0, "mm"),
             ("Y", LIMITS_Y[0], LIMITS_Y[1], 0.0, "mm"),
-            ("Z", LIMITS_Z[0], LIMITS_Z[1], Z_HOME, "mm")
+            ("Z", LIMITS_Z[0], LIMITS_Z[1], 0.0, "mm")
         ]
 
         for axis, min_v, max_v, init_v, unit in pos_configs:
@@ -347,7 +363,7 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
 
-        # Pointing Angle Controls: Alpha (Azimuth) & Beta (Elevation)
+        # Pointing Angle Controls: Alpha (Azimuth) & Beta (Elevation from Horizon)
         grp_polar = QGroupBox("Orientación Polar / Espacio de Tarea")
         polar_layout = QVBoxLayout(grp_polar)
         polar_layout.setSpacing(8)
@@ -377,7 +393,7 @@ class MainWindow(QMainWindow):
         row_alpha.addWidget(self.spin_alpha)
         polar_layout.addLayout(row_alpha)
 
-        # Beta (Elevation / Tilt)
+        # Beta (Elevation from horizon, 90° = Cenit/Home)
         row_beta = QHBoxLayout()
         lbl_b = QLabel("Beta (β):")
         lbl_b.setStyleSheet("font-weight: 700; color: #00E5FF;")
@@ -385,11 +401,12 @@ class MainWindow(QMainWindow):
 
         self.slider_beta = QSlider(Qt.Orientation.Horizontal)
         self.slider_beta.setRange(int(LIMITS_BETA[0] * 10), int(LIMITS_BETA[1] * 10))
-        self.slider_beta.setValue(0)
+        self.slider_beta.setValue(900)  # Cenit = 90°
 
         self.spin_beta = QDoubleSpinBox()
         self.spin_beta.setRange(LIMITS_BETA[0], LIMITS_BETA[1])
         self.spin_beta.setDecimals(1)
+        self.spin_beta.setValue(90.0)
         self.spin_beta.setSuffix(" ° (Elev)")
         self.spin_beta.setFixedWidth(100)
 
@@ -405,7 +422,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(grp_polar)
 
         # Trajectory Generator & Spline Tracking Group
-        grp_traj = QGroupBox("Generador de Trayectorias (SimpleCubicSpline)")
+        grp_traj = QGroupBox("Generador de Trayectorias (Secuencia APPROACH → TRACK → RETURN)")
         traj_layout = QVBoxLayout(grp_traj)
         traj_layout.setSpacing(8)
 
@@ -415,6 +432,7 @@ class MainWindow(QMainWindow):
         lbl_prof.setStyleSheet("color: #90A4AE; font-size: 11px;")
         self.combo_traj_pattern = QComboBox()
         self.combo_traj_pattern.addItems([
+            "Secuencia Demo (LMT: 10.1°, 45.6°, 10.0°)",
             "Precesión Cónica (Círculo Alpha 360°)",
             "Figura en 8 (Lemniscata Polar)",
             "Espiral de Escaneo (Scan Spiral)",
@@ -435,16 +453,16 @@ class MainWindow(QMainWindow):
         lbl_dur = QLabel("Duración:")
         lbl_dur.setStyleSheet("color: #90A4AE; font-size: 11px;")
         self.spin_traj_dur = QDoubleSpinBox()
-        self.spin_traj_dur.setRange(3.0, 120.0)
-        self.spin_traj_dur.setValue(12.0)
+        self.spin_traj_dur.setRange(3.0, 720.0)
+        self.spin_traj_dur.setValue(60.0)
         self.spin_traj_dur.setSuffix(" s")
         self.spin_traj_dur.setFixedWidth(75)
 
         lbl_amp = QLabel("Amplitud β:")
         lbl_amp.setStyleSheet("color: #90A4AE; font-size: 11px;")
         self.spin_traj_amp = QDoubleSpinBox()
-        self.spin_traj_amp.setRange(2.0, 30.0)
-        self.spin_traj_amp.setValue(15.0)
+        self.spin_traj_amp.setRange(2.0, 80.0)
+        self.spin_traj_amp.setValue(45.0)
         self.spin_traj_amp.setSuffix(" °")
         self.spin_traj_amp.setFixedWidth(75)
 
@@ -674,9 +692,14 @@ class MainWindow(QMainWindow):
 
     @Slot(list)
     def _on_telemetry_received(self, actual_vals: list):
-        self.actual_q = np.array(actual_vals, dtype=np.float64)
-        # Update telemetry plot with target vs actual
-        self.telemetry_plot.update_telemetry(self.current_q, self.actual_q)
+        vals = np.array(actual_vals, dtype=np.float64)
+        if len(vals) == 6:
+            if np.max(vals) <= 100.0:
+                self.actual_q = percent_to_length(vals, L0, STROKE)
+            else:
+                self.actual_q = vals
+            # Update telemetry plot with target vs actual
+            self.telemetry_plot.update_telemetry(self.current_q, self.actual_q)
 
     # =========================================================================
     # KINEMATICS & CONTROL DISPATCH
@@ -685,9 +708,11 @@ class MainWindow(QMainWindow):
         if index == 0:
             self.control_mode = "CARTESIAN"
             self.badge_mode.set_status("CARTESIANO", "cyan")
+            self._on_cartesian_changed()
         elif index == 1:
             self.control_mode = "TRACK"
             self.badge_mode.set_status("TRACK (α/β)", "cyan")
+            self._on_track_angles_changed()
         else:
             self.control_mode = "ACTUATORS"
             self.badge_mode.set_status("MONITOR L1-L6", "amber")
@@ -704,8 +729,8 @@ class MainWindow(QMainWindow):
         pitch = self.spins_rot["Pitch"].value()
         yaw = self.spins_rot["Yaw"].value()
 
-        # Compute Inverse Kinematics
-        q_mm, da, R = pose_to_q(x, y, z, roll, pitch, yaw)
+        # Compute Inverse Kinematics (degrees converted automatically)
+        q_mm, da, R = pose_to_q(x, y, z, roll, pitch, yaw, deg=True)
         self._apply_kinematics_result(q_mm, da, R)
 
         self.lbl_sb_pose.setText(
@@ -715,20 +740,21 @@ class MainWindow(QMainWindow):
     def _on_track_angles_changed(self):
         """Called when Alpha or Beta slider / spinbox changes."""
         if self.is_tracking:
-            return  # During active trajectory, let the spline drive angles
+            return  # During active trajectory, let TrajectoryGenerator drive angles
 
         alpha = self.spin_alpha.value()
         beta = self.spin_beta.value()
 
-        q_mm, da, R = inverse_kinematics(y=[alpha, beta], z_nominal=Z_HOME)
+        # Compute Inverse Kinematics (beta is elevation from horizon, 90° = Zenith)
+        q_mm, da, R = inverse_kinematics([alpha, beta], rt=RT, a0=ALPHA_0, D=D, deg=True)
         self._apply_kinematics_result(q_mm, da, R)
 
-        self.lbl_sb_pose.setText(f"Track: α: {alpha:+.1f}° | β: {beta:.1f}° | Z: {Z_HOME:.1f} mm")
+        self.lbl_sb_pose.setText(f"Track: α: {alpha:+.1f}° | β: {beta:.1f}° | Z: {da[2]:.1f} mm")
 
     def _apply_kinematics_result(self, q_mm: np.ndarray, da: np.ndarray, R: np.ndarray):
         """
         Updates 3D visualizer, actuator level bars, Jacobian, transformation matrix,
-        and streams serial position command if enabled.
+        telemetry plot, and streams serial position command if enabled.
         """
         self.current_q = q_mm
         self.current_da = da
@@ -741,7 +767,7 @@ class MainWindow(QMainWindow):
         self.actuator_cluster.update_actuators(q_mm)
 
         # 3. Calculate Jacobian and Singularity Metrics
-        J_inv = InvJac(da, R)
+        J_inv = InvJac(da, R, Az=Az, Bz=Bz)
         metrics = calculate_singularity_metrics(J_inv)
 
         self.lbl_manip_val.setText(f"{metrics['manipulability']:.2e}")
@@ -766,114 +792,145 @@ class MainWindow(QMainWindow):
         )
         self.txt_matrix.setText(mat_str)
 
-        # 5. Send serial positions if streaming enabled
+        # 5. Convert to stroke percent and stream serial command if enabled
+        pct = length_to_percent(q_mm, l0=L0, stroke=STROKE)
+        self.current_pct = pct
+
         if self.chk_stream.isChecked() and self.serial_manager.is_connected:
-            self.serial_manager.send_positions(q_mm)
+            self.serial_manager.send_positions(pct)
+
+        # 6. Update telemetry plot with target vs actual
+        self.telemetry_plot.update_telemetry(self.current_q, self.actual_q)
 
     def _reset_cartesian_zero(self):
-        """Zero out XY and rotation, maintain nominal Z."""
-        self.spins_pos["X"].setValue(0.0)
-        self.spins_pos["Y"].setValue(0.0)
-        self.spins_pos["Z"].setValue(Z_HOME)
-        self.spins_rot["Roll"].setValue(0.0)
-        self.spins_rot["Pitch"].setValue(0.0)
-        self.spins_rot["Yaw"].setValue(0.0)
+        """Zero out XY and rotation, and set nominal relative Z offset to 0.0."""
+        for axis in ["X", "Y", "Z"]:
+            if axis in self.spins_pos:
+                self.spins_pos[axis].blockSignals(True)
+                self.spins_pos[axis].setValue(0.0)
+                if axis in self.sliders_pos:
+                    self.sliders_pos[axis].setValue(0)
+                self.spins_pos[axis].blockSignals(False)
+
+        for rot in ["Roll", "Pitch", "Yaw"]:
+            if rot in self.spins_rot:
+                self.spins_rot[rot].blockSignals(True)
+                self.spins_rot[rot].setValue(0.0)
+                if rot in self.sliders_rot:
+                    self.sliders_rot[rot].setValue(0)
+                self.spins_rot[rot].blockSignals(False)
 
     # =========================================================================
-    # TRAJECTORY TRACKING (SimpleCubicSpline Engine)
+    # TRAJECTORY TRACKING (TrajectoryGenerator 4-Phase Sequence)
     # =========================================================================
     def start_trajectory_tracking(self):
-        """Generate trajectory spline and start 30 Hz execution timer."""
+        """
+        Execute full 4-phase trajectory sequence:
+        HOME → APPROACH → TRACK → RETURN → HOME
+        Uses authentic TrajectoryGenerator with 2nd order filtering.
+        """
         pattern = self.combo_traj_pattern.currentText()
         duration = self.spin_traj_dur.value()
         amp_beta = self.spin_traj_amp.value()
 
-        # Build waypoints: t and y=[alpha, beta]
-        n_pts = 40
-        t_arr = np.linspace(0.0, duration, n_pts)
-        y_pts = []
+        # Partition duration: home/approach (min 10s or 16%), track, return
+        t_home = min(10.0, max(2.0, duration * (10.0 / 60.0)))
+        t_track = max(t_home + 2.0, duration - t_home)
 
-        if "Precesión" in pattern:
-            # Cone precession: alpha goes 0 -> 360°, beta constant amplitude
-            for t in t_arr:
-                alpha = (t / duration) * 360.0 - 180.0
-                beta = amp_beta * (0.5 - 0.5 * np.cos(2 * np.pi * t / duration))
-                y_pts.append([alpha, beta])
-
+        # Select 3 waypoints [alpha, beta] in degrees (beta = elevation from horizon)
+        if "Secuencia Demo" in pattern:
+            pts_deg = [list(pt) for pt in TRAJ_POINTS]
+        elif "Precesión" in pattern:
+            elev = max(5.0, 90.0 - amp_beta)
+            pts_deg = [[0.0, elev], [180.0, elev], [360.0, elev]]
         elif "Figura en 8" in pattern:
-            # Polar figure-8 (Lemniscate): alpha oscillates, beta oscillates at 2x frequency
-            for t in t_arr:
-                tau = 2 * np.pi * (t / duration)
-                alpha = 90.0 * np.sin(tau)
-                beta = amp_beta * np.abs(np.sin(2 * tau))
-                y_pts.append([alpha, beta])
-
+            elev_min = max(5.0, 90.0 - amp_beta)
+            pts_deg = [[-45.0, elev_min], [0.0, 90.0 - amp_beta * 0.3], [45.0, elev_min]]
         elif "Espiral" in pattern:
-            # Spiral scan: expanding cone
-            for t in t_arr:
-                fraction = t / duration
-                alpha = (fraction * 3.0 * 360.0) % 360.0 - 180.0
-                beta = amp_beta * fraction
-                y_pts.append([alpha, beta])
-
+            pts_deg = [[30.0, 90.0 - amp_beta * 0.2], [180.0, 90.0 - amp_beta * 0.6], [360.0, 90.0 - amp_beta]]
         elif "Escalón" in pattern:
-            # Step response: smooth transition from 0 to target
-            for t in t_arr:
-                step_val = amp_beta if t >= duration * 0.25 else 0.0
-                y_pts.append([45.0 if t >= duration * 0.25 else 0.0, step_val])
-
+            elev = max(5.0, 90.0 - amp_beta)
+            pts_deg = [[45.0, elev], [45.0, elev], [45.0, elev]]
+        elif "Waypoints Personalizados" in pattern and self.custom_traj_points is not None:
+            pts_deg = [list(pt) for pt in self.custom_traj_points]
         else:
-            # Fallback gentle circle
-            for t in t_arr:
-                tau = 2 * np.pi * (t / duration)
-                y_pts.append([180.0 * np.sin(tau), amp_beta * np.cos(tau)])
+            pts_deg = [list(pt) for pt in TRAJ_POINTS]
 
         try:
-            self.trajectory_spline = SimpleCubicSpline(t=t_arr, y=y_pts)
-            self.traj_duration = duration
-            self.traj_start_time = time.time()
+            pts_rad = np.radians(pts_deg)
+            self.traj_cfg = TrajectoryConfig(
+                t_home_end=t_home,
+                t_tracking_end=t_track,
+                dt=0.033,
+                filter_wn=FILTER_WN
+            )
+            self.traj_gen = TrajectoryGenerator(self.traj_cfg)
+            self.traj_gen.set_tracking_points(pts_rad)
+            self.traj_gen.reset()
+
+            self.traj_duration = t_track + t_home
             self.traj_elapsed = 0.0
+            self.last_tick_time = time.time()
             self.is_tracking = True
             self.is_traj_paused = False
+            self.hold_phase = None
 
             self.btn_start_track.setEnabled(False)
             self.btn_pause_track.setText("⏸ PAUSA TRACK")
             self.traj_progress.setValue(0)
+            self.badge_mode.set_status("TRAJ: APPROACH", "cyan")
             self.traj_timer.start()
 
-            self.log_message(f"[TRAJ] Seguimiento de trayectoria iniciado: {pattern} ({duration:.1f}s)")
+            self.log_message(
+                f"[TRAJ] Secuencia iniciada: {pattern} (Total: {self.traj_duration:.1f}s, "
+                f"Approach: {t_home:.1f}s, Track: {t_track - t_home:.1f}s, Return: {t_home:.1f}s)"
+            )
         except Exception as e:
-            self.log_error(f"[TRAJ] Error creando Spline: {e}")
+            self.log_error(f"[TRAJ] Error iniciando generador de trayectoria: {e}")
 
     def _trajectory_tick(self):
-        """Execute one step of the trajectory spline interpolation."""
-        if not self.is_tracking or self.trajectory_spline is None:
+        """Execute one step of the 4-phase trajectory tracking sequence."""
+        if not self.is_tracking or self.traj_gen is None:
             return
 
         now = time.time()
-        self.traj_elapsed = now - self.traj_start_time
+        dt = now - self.last_tick_time
+        self.last_tick_time = now
+        if dt <= 0.0 or dt > 0.15:
+            dt = 0.033
 
-        if self.traj_elapsed >= self.traj_duration:
-            # Trajectory completed
-            self.abort_trajectory()
+        self.traj_elapsed += dt
+        t = self.traj_elapsed
+        t_return_end = self.traj_cfg.t_tracking_end + self.traj_cfg.t_home_end
+
+        if t >= t_return_end or self.traj_gen.phase == "done":
+            # Sequence complete: transition to HOME
+            self.go_home()
             self.traj_progress.setValue(100)
-            self.log_message("[TRAJ] Trayectoria completada con éxito.")
+            self.log_message("[TRAJ] Secuencia completada con éxito: RETURN → HOME.")
             return
 
-        # Query cubic spline
-        y_interp = self.trajectory_spline.evaluate(self.traj_elapsed)
-        alpha, beta = float(y_interp[0]), float(y_interp[1])
+        # Query authentic TrajectoryGenerator
+        y_des, yp_des = self.traj_gen.step(t, dt=dt)
+        alpha_rad, beta_rad = float(y_des[0]), float(y_des[1])
+        alpha_deg = float(np.rad2deg(alpha_rad))
+        beta_deg = float(np.rad2deg(beta_rad))
 
-        # Reflect in GUI polar controls without retriggering manual event
+        # Phase mapping: "home" -> APPROACH, "tracking" -> TRACK, "return" -> RETURN, "done" -> HOME
+        phase_map = {"home": "APPROACH", "tracking": "TRACK", "return": "RETURN", "done": "HOME"}
+        phase_str = phase_map.get(self.traj_gen.phase, "TRACK")
+        self.badge_mode.set_status(f"TRAJ: {phase_str}", "cyan")
+
+        # Update GUI sliders / spinboxes without retriggering manual event
         self.spin_alpha.blockSignals(True)
         self.spin_beta.blockSignals(True)
         self.slider_alpha.blockSignals(True)
         self.slider_beta.blockSignals(True)
 
-        self.spin_alpha.setValue(alpha)
-        self.slider_alpha.setValue(int(alpha))
-        self.spin_beta.setValue(beta)
-        self.slider_beta.setValue(int(beta * 10))
+        self.spin_alpha.setValue(alpha_deg)
+        self.slider_alpha.setValue(int(alpha_deg))
+        self.spin_beta.setValue(beta_deg)
+        self.slider_beta.setValue(int(beta_deg * 10))
 
         self.spin_alpha.blockSignals(False)
         self.spin_beta.blockSignals(False)
@@ -881,33 +938,35 @@ class MainWindow(QMainWindow):
         self.slider_beta.blockSignals(False)
 
         # Compute and dispatch kinematics
-        q_mm, da, R = inverse_kinematics(y=[alpha, beta], z_nominal=Z_HOME)
+        q_mm, da, R = inverse_kinematics([alpha_rad, beta_rad], rt=RT, a0=ALPHA_0, D=D, deg=False)
         self._apply_kinematics_result(q_mm, da, R)
 
-        # Update progress
-        pct = int((self.traj_elapsed / self.traj_duration) * 100)
+        # Update progress bar
+        pct = int(min(100, max(0, (t / t_return_end) * 100)))
         self.traj_progress.setValue(pct)
         self.lbl_sb_pose.setText(
-            f"Tracking t={self.traj_elapsed:.2f}s | α: {alpha:+.1f}° | β: {beta:.1f}°"
+            f"[{phase_str}] t={t:.2f}s / {t_return_end:.1f}s | α: {alpha_deg:+.1f}° | β: {beta_deg:.1f}°"
         )
 
     def toggle_pause_trajectory(self):
-        """Pause or resume trajectory execution."""
+        """Pause or resume trajectory execution in HOLD state."""
         if not self.is_tracking:
             return
 
         if not self.is_traj_paused:
             self.traj_timer.stop()
             self.is_traj_paused = True
-            self.traj_pause_time = time.time()
+            self.hold_phase = self.traj_gen.phase if self.traj_gen else "HOLD"
             self.btn_pause_track.setText("▶ REANUDAR")
-            self.log_message("[TRAJ] Trayectoria en pausa.")
+            self.badge_mode.set_status(f"HOLD ({self.hold_phase.upper()})", "amber")
+            self.log_message(f"[TRAJ] Pausa activada: plataforma en HOLD ({self.hold_phase.upper()}).")
         else:
-            pause_delta = time.time() - self.traj_pause_time
-            self.traj_start_time += pause_delta
             self.is_traj_paused = False
+            self.last_tick_time = time.time()
             self.traj_timer.start()
             self.btn_pause_track.setText("⏸ PAUSA TRACK")
+            phase_str = self.hold_phase.upper() if self.hold_phase else "TRACK"
+            self.badge_mode.set_status(f"TRAJ: {phase_str}", "cyan")
             self.log_message("[TRAJ] Trayectoria reanudada.")
 
     def abort_trajectory(self):
@@ -918,23 +977,35 @@ class MainWindow(QMainWindow):
         self.btn_start_track.setEnabled(True)
         self.btn_pause_track.setText("⏸ PAUSA TRACK")
         self.traj_progress.setValue(0)
+        self.badge_mode.set_status("TRACK (α/β)", "cyan")
         self.log_message("[TRAJ] Trayectoria detenida.")
 
     def _load_custom_waypoints(self):
-        """Load external CSV file containing (time, alpha, beta) columns."""
+        """Load external CSV file containing (time, alpha, beta) or (alpha, beta) columns."""
         path, _ = QFileDialog.getOpenFileName(self, "Cargar Waypoints CSV", "", "CSV Files (*.csv);;All Files (*)")
         if not path:
             return
         try:
             data = np.loadtxt(path, delimiter=",", skiprows=1)
-            if data.shape[1] < 3:
-                raise ValueError("El archivo debe contener al menos 3 columnas: tiempo, alpha, beta.")
-            t_pts = data[:, 0]
-            y_pts = data[:, 1:3]
-            self.trajectory_spline = SimpleCubicSpline(t_pts, y_pts)
-            self.spin_traj_dur.setValue(float(t_pts[-1] - t_pts[0]))
+            if data.ndim == 1:
+                data = data.reshape(1, -1)
+            if data.shape[1] == 2:
+                pts = data[:, :2]
+            elif data.shape[1] >= 3:
+                pts = data[:, 1:3]
+            else:
+                raise ValueError("El archivo debe contener al menos 2 columnas: [alpha, beta] o 3: [tiempo, alpha, beta].")
+
+            if len(pts) >= 3:
+                indices = [0, len(pts) // 2, -1]
+                self.custom_traj_points = [pts[i].tolist() for i in indices]
+            elif len(pts) == 1:
+                self.custom_traj_points = [pts[0].tolist(), pts[0].tolist(), pts[0].tolist()]
+            else:
+                self.custom_traj_points = [pts[0].tolist(), pts[1].tolist(), pts[1].tolist()]
+
             self.combo_traj_pattern.setCurrentText("Waypoints Personalizados (CSV)")
-            self.log_message(f"[TRAJ] Waypoints cargados exitosamente desde {path} ({len(t_pts)} puntos).")
+            self.log_message(f"[TRAJ] Waypoints cargados exitosamente desde {path} ({len(pts)} puntos).")
         except Exception as e:
             QMessageBox.critical(self, "Error de Waypoints", f"No se pudo cargar el archivo:\n{e}")
 
@@ -942,11 +1013,38 @@ class MainWindow(QMainWindow):
     # GLOBAL CONTROLS: HOME, PAUSE, ESTOP, CALIBRATION
     # =========================================================================
     def go_home(self):
-        """Return platform to nominal home pose."""
+        """Return platform to nominal home pose (Zenith: alpha=0, beta=90°, stroke 0%)."""
         self.abort_trajectory()
         self._reset_cartesian_zero()
+
+        # Reset polar inputs to Zenith (alpha=0, beta=90°)
+        self.spin_alpha.blockSignals(True)
+        self.spin_beta.blockSignals(True)
+        self.slider_alpha.blockSignals(True)
+        self.slider_beta.blockSignals(True)
+
+        self.spin_alpha.setValue(0.0)
+        self.slider_alpha.setValue(0)
+        self.spin_beta.setValue(90.0)
+        self.slider_beta.setValue(900)
+
+        self.spin_alpha.blockSignals(False)
+        self.spin_beta.blockSignals(False)
+        self.slider_alpha.blockSignals(False)
+        self.slider_beta.blockSignals(False)
+
+        if hasattr(self, 'traj_gen') and self.traj_gen:
+            self.traj_gen.reset()
+
+        # Compute Home kinematics at Zenith (alpha=0, beta=pi/2)
+        q_mm, da, R = inverse_kinematics([0.0, np.pi / 2], rt=RT, a0=ALPHA_0, D=D, deg=False)
+        self._apply_kinematics_result(q_mm, da, R)
+
+        # Send home command via serial
         self.serial_manager.home()
-        self.log_message("[HOME] Retornando a posición segura nominal.")
+        self.badge_mode.set_status("HOME (CENIT)", "cyan")
+        self.lbl_sb_pose.setText(f"HOME (Cenit): α: 0.0° | β: 90.0° | Z: {D[2]:.1f} mm")
+        self.log_message("[HOME] Retornado a posición segura nominal (Cenit, carrera 0%).")
 
     def toggle_pause(self):
         """Global pause."""

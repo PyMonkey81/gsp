@@ -20,8 +20,8 @@ from ui.styles import (
 )
 
 # Mechanical center of the platform mechanism (base at z=0, platform nominal at z=300)
-ROBOT_CENTER = QVector3D(0.0, 0.0, float(Z_HOME / 2.0))  # (0, 0, 150) mm
-DEFAULT_CAM_DISTANCE = 720.0
+ROBOT_CENTER = QVector3D(0.0, 0.0, float(Z_HOME / 2.0))
+DEFAULT_CAM_DISTANCE = 550.0
 DEFAULT_CAM_ELEVATION = 22.0
 DEFAULT_CAM_AZIMUTH = 45.0
 
