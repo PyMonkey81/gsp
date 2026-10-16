@@ -12,6 +12,9 @@ import numpy as np
 
 # Import authentic kinematics from kinematics package
 from kinematics.inverse import inverse_kinematics as _raw_ik, TIK, PIK
+from kinematics.direct import (
+    direct_kinematics as _raw_dk, CA, TSDK, TSVK, PDK, R_to_rpy
+)
 from kinematics.pose import pose_to_q as _raw_pose_to_q, rpy_to_R
 from kinematics.jacobian import InvJac as _raw_inv_jac
 from logic.spline import SimpleCubicSpline
@@ -44,6 +47,26 @@ def inverse_kinematics(y, rt=RT, a0=ALPHA_0, D=D, deg: bool = True):
     else:
         y_rad = y_arr[:2]
     return _raw_ik(y_rad, rt=rt, a0=a0, D=D)
+
+
+def direct_kinematics(
+    q, qp=None, da0=None, R0=None, Az=Az, Bz=Bz, D=D, rt=RT, a0=ALPHA_0, deg: bool = True
+):
+    """
+    Direct kinematics from actuator lengths q (and optional velocities qp).
+    Returns task-space angles Y=[alpha, beta] (in degrees if deg=True, else radians),
+    along with (da, R) or (Yp, da, R, Va, Omega).
+    """
+    res = _raw_dk(q, qp=qp, da0=da0, R0=R0, Az=Az, Bz=Bz, D=D, rt=rt, a0=a0)
+    if qp is None:
+        Y_rad, da, R = res
+        Y_out = np.rad2deg(Y_rad) if deg else Y_rad
+        return Y_out, da, R
+    else:
+        Y_rad, Yp_rad, da, R, Va, Omega = res
+        Y_out = np.rad2deg(Y_rad) if deg else Y_rad
+        Yp_out = np.rad2deg(Yp_rad) if deg else Yp_rad
+        return Y_out, Yp_out, da, R, Va, Omega
 
 
 def InvJac(da: np.ndarray, R: np.ndarray, Az=Az, Bz=Bz):

@@ -37,6 +37,8 @@ from ui.widgets.led_indicator import StatusBadge
 from ui.widgets.actuator_bars import ActuatorClusterWidget
 from ui.widgets.gl_view import Platform3DView
 from ui.widgets.telemetry_plot import TelemetryPlotWidget
+from ui.dialogs import ParametersDialog, SerialConfigDialog, load_parameters
+import config.parameters as param_module
 
 
 class MainWindow(QMainWindow):
@@ -184,11 +186,18 @@ class MainWindow(QMainWindow):
         # Connect / Disconnect Button
         self.btn_connect = QPushButton("CONECTAR")
         self.btn_connect.setObjectName("PrimaryButton")
-        self.btn_connect.setFixedWidth(110)
+        self.btn_connect.setFixedWidth(100)
         self.btn_connect.clicked.connect(self._toggle_connection)
         layout.addWidget(self.btn_connect)
 
-        layout.addSpacing(12)
+        # Serial Config Dialog Button
+        self.btn_serial_config = QPushButton("⚙ CONFIG")
+        self.btn_serial_config.setFixedWidth(75)
+        self.btn_serial_config.setToolTip("Configuración de comunicación serial y simulador")
+        self.btn_serial_config.clicked.connect(self.open_serial_config)
+        layout.addWidget(self.btn_serial_config)
+
+        layout.addSpacing(10)
 
         # Status Badges
         self.badge_conn = StatusBadge("ESTADO", "DESCONECTADO", "red")
@@ -205,6 +214,12 @@ class MainWindow(QMainWindow):
         self.chk_stream.setChecked(True)
         self.chk_stream.setStyleSheet("font-size: 10px; font-weight: 600; color: #90A4AE;")
         layout.addWidget(self.chk_stream)
+
+        # Parameters Dialog Button
+        self.btn_parameters = QPushButton("📐 PARÁMETROS")
+        self.btn_parameters.setToolTip("Configuración de parámetros del sistema (Geometría, Actuadores, Trayectoria, Az/Bz)")
+        self.btn_parameters.clicked.connect(self.open_parameter_dialog)
+        layout.addWidget(self.btn_parameters)
 
         # Home Button
         self.btn_home = QPushButton("⌂ HOME")
@@ -595,6 +610,10 @@ class MainWindow(QMainWindow):
         self.btn_zero_sensors = QPushButton("⌖ CERAR SENSORES")
         self.btn_zero_sensors.clicked.connect(self.zero_sensors)
         btn_bar.addWidget(self.btn_zero_sensors)
+
+        self.btn_params_bottom = QPushButton("📐 PARÁMETROS")
+        self.btn_params_bottom.clicked.connect(self.open_parameter_dialog)
+        btn_bar.addWidget(self.btn_params_bottom)
 
         btn_clear_log = QPushButton("Limpiar Log")
         btn_clear_log.setFixedHeight(22)
@@ -1079,6 +1098,47 @@ class MainWindow(QMainWindow):
         """Zero sensor readouts."""
         self.serial_manager.zero_sensors()
         self.log_message("[SENSORS] Sensores de retroalimentación reseteados a cero.")
+
+    def open_serial_config(self):
+        """Open modal serial communication configuration dialog."""
+        dialog = SerialConfigDialog(self.serial_manager, self)
+        dialog.exec()
+        self.refresh_ports()
+
+    def open_parameter_dialog(self):
+        """Open modal system parameters dialog."""
+        dialog = ParametersDialog(current_params=load_parameters(), parent=self)
+        dialog.parameters_changed.connect(self._on_parameters_changed)
+        dialog.exec()
+
+    def _on_parameters_changed(self, params: dict):
+        """Handle system parameters update and refresh kinematics/views."""
+        self.log_message("[CONFIG] Nuevos parámetros del sistema aplicados y guardados.")
+        if "L0" in params:
+            param_module.L0 = float(params["L0"])
+        if "STROKE" in params:
+            param_module.STROKE = float(params["STROKE"])
+        if "RT" in params:
+            param_module.RT = float(params["RT"])
+        if "ALPHA_0" in params:
+            param_module.ALPHA_0 = float(params["ALPHA_0"])
+        if "D" in params:
+            param_module.D = np.array(params["D"], dtype=np.float64)
+            self.current_da = param_module.D.copy()
+        if "Az" in params:
+            param_module.Az = np.array(params["Az"], dtype=np.float64)
+            self.gl_view.platform_joints = param_module.Az.copy()
+        if "Bz" in params:
+            param_module.Bz = np.array(params["Bz"], dtype=np.float64)
+            self.gl_view.base_joints = param_module.Bz.copy()
+        if "TRAJ_POINTS" in params:
+            self.current_traj_points = [list(pt) for pt in params["TRAJ_POINTS"]]
+
+        # Re-evaluate kinematics to reflect updated geometry
+        if self.control_mode == "CARTESIAN":
+            self._on_cartesian_changed()
+        else:
+            self._on_track_angles_changed()
 
     # =========================================================================
     # LOGGING UTILITIES

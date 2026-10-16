@@ -1,5 +1,5 @@
 {
-  "L0": 248.4,
+  "L0": 249.4,
   "STROKE": 100.0,
   "ACTUATOR_HOME_PERCENT": 0.0,
   "ALPHA_0": 0.0,
@@ -94,7 +94,5 @@
       -20.85,
       44.32
     ]
-  ],
-  "ACTUATOR_MIN": 248.4,
-  "ACTUATOR_MAX": 348.4
+  ]
 }
