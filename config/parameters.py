@@ -35,21 +35,21 @@ EXT_MAX = STROKE
 # Az: puntos de anclaje en marco plataforma móvil
 # Bz: puntos de anclaje en marco base fijo (Pin01 a Pin06)
 Az = np.array([
-    [ 46.95,  39.63, -44.33],     # eje 1 (Pin01)
-    [ 10.84,  60.48, -44.33],     # eje 2
-    [-57.79,  20.85, -44.33],     # eje 3
-    [-57.79, -20.85, -44.33],     # eje 4
-    [ 10.84, -60.48, -44.33],     # eje 5
-    [ 46.95, -39.63, -44.33],     # eje 6
+    [ 19.09,  23.87, -35.24],     # eje 1 (Pin01)
+    [ 11.13,  28.46, -35.24],     # eje 2
+    [-30.21,   4.60, -35.24],     # eje 3
+    [-30.21,  -4.60, -35.24],     # eje 4
+    [ 11.13, -28.46, -35.24],     # eje 5
+    [ 19.09, -23.87, -35.24],     # eje 6
 ], dtype=np.float64)
 
 Bz = np.array([
-    [ 87.79,  20.85, 44.32],      # eje 1 (Pin01)
-    [-25.84,  86.46, 44.32],      # eje 2
-    [-61.95,  65.61, 44.32],      # eje 3
-    [-61.95, -65.61, 44.32],      # eje 4
-    [-25.84, -86.46, 44.32],      # eje 5
-    [ 87.79, -20.85, 44.32],      # eje 6
+    [ 62.32,   9.84, 35.70],      # eje 1 (Pin01)
+    [-22.64,  58.89, 35.70],      # eje 2
+    [-39.68,  49.05, 35.70],      # eje 3
+    [-39.68, -49.05, 35.70],      # eje 4
+    [-22.64, -58.89, 35.70],      # eje 5
+    [ 62.32,  -9.84, 35.70],      # eje 6
 ], dtype=np.float64)
 
 # Compatibilidad con visor 3D
@@ -58,8 +58,8 @@ PLATFORM_JOINTS = Az
 
 # ====================== Parámetros de la plataforma (en mm) ======================
 ALPHA_0 = 0.0
-D = np.array([0.0, 0.0, 331.94], dtype=np.float64)  # Centro de agujero (HOME: da = D, R = I)
-RT = 90.0                                           # Radio de la semiesfera virtual (da = D + rt * R[:, 2])
+D = np.array([0.0, 0.0, 314.13], dtype=np.float64)  # Centro de agujero (HOME: da = D, R = I)
+RT = 85.0                                           # Radio de la semiesfera virtual (da = D + rt * R[:, 2])
 Z_HOME = float(D[2])
 
 # ====================== Controlador Sliding-PI ======================
