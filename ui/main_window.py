@@ -59,6 +59,16 @@ class MainWindow(QMainWindow):
         # Initialize Serial Communication Manager
         self.serial_manager = SerialManager(self)
 
+        # Timer de keep-alive (ping cada 3 segundos)
+        self.ping_timer = QTimer(self)
+        self.ping_timer.setInterval(3000)  # 3 segundos
+        self.ping_timer.timeout.connect(self._send_keep_alive)
+
+        # Timer de lectura continua de posición real en pestaña Actuadores (cada 500 ms)
+        self.actuator_poll_timer = QTimer(self)
+        self.actuator_poll_timer.setInterval(500)
+        self.actuator_poll_timer.timeout.connect(self._poll_actuator_position)
+
         # State Variables initialized at HOME (all actuators retracted = 0.0 mm extension)
         q_home, da_home, R_home = home_kinematics()
         self.current_da = da_home.copy()
@@ -203,6 +213,13 @@ class MainWindow(QMainWindow):
         self.btn_serial_config.setToolTip("Configuración de comunicación serial y simulador")
         self.btn_serial_config.clicked.connect(self.open_serial_config)
         layout.addWidget(self.btn_serial_config)
+
+        # Read Hardware Position Button
+        self.btn_read_pos = QPushButton("📍 LEER POS")
+        self.btn_read_pos.setFixedWidth(90)
+        self.btn_read_pos.setToolTip("Consultar posición actual al firmware ('getpos')")
+        self.btn_read_pos.clicked.connect(self.read_hardware_position)
+        layout.addWidget(self.btn_read_pos)
 
         layout.addSpacing(10)
 
@@ -529,7 +546,22 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(6)
 
+        # Header toolbar for Actuators tab
+        hdr_act = QHBoxLayout()
+        lbl_info = QLabel("Sliders Independientes (L1–L6) | Comando individual: aN [0–100%]")
+        lbl_info.setStyleSheet("color: #90A4AE; font-size: 11px; font-weight: 600;")
+        hdr_act.addWidget(lbl_info)
+        hdr_act.addStretch()
+
+        self.btn_read_pos_tab = QPushButton("Leer posición")
+        self.btn_read_pos_tab.setObjectName("PrimaryButton")
+        self.btn_read_pos_tab.setToolTip("Consultar posición actual al firmware mediante 'getpos'")
+        self.btn_read_pos_tab.clicked.connect(self.read_hardware_position)
+        hdr_act.addWidget(self.btn_read_pos_tab)
+        layout.addLayout(hdr_act)
+
         self.actuator_cluster = ActuatorClusterWidget()
+        self.actuator_cluster.actuator_moved.connect(self._on_single_actuator_moved)
         layout.addWidget(self.actuator_cluster)
         layout.addStretch()
 
@@ -666,6 +698,7 @@ class MainWindow(QMainWindow):
         self.serial_manager.connected.connect(self._on_serial_connected)
         self.serial_manager.disconnected.connect(self._on_serial_disconnected)
         self.serial_manager.telemetry_received.connect(self._on_telemetry_received)
+        self.serial_manager.real_position_received.connect(self._on_real_position_received)
         self.serial_manager.message_received.connect(self.log_message)
         self.serial_manager.error_occurred.connect(self.log_error)
         self.serial_manager.safe_mode_changed.connect(self._on_safe_mode_changed)
@@ -701,6 +734,14 @@ class MainWindow(QMainWindow):
         self.btn_connect.setStyleSheet(f"background-color: {COLOR_EMERGENCY}; border: 1px solid #FF5252;")
         self.badge_conn.set_status("CONECTADO", "green")
         self.log_message(f"[SERIAL] Conectado a {port} a {baud} baudios.")
+        self.ping_timer.start()
+
+        # Enviar comando de inicialización de ADS1256 una sola vez (no bloqueante)
+        self.serial_manager.send_raw("adsinit")
+
+        # Iniciar polling de 500 ms si la pestaña Actuadores está actualmente visible
+        if self.tab_widget.currentIndex() == 2 and not self.is_tracking:
+            self._start_actuator_polling()
 
     @Slot()
     def _on_serial_disconnected(self):
@@ -708,6 +749,8 @@ class MainWindow(QMainWindow):
         self.btn_connect.setStyleSheet("")
         self.badge_conn.set_status("DESCONECTADO", "red")
         self.log_message("[SERIAL] Desconectado.")
+        self.ping_timer.stop()
+        self._stop_actuator_polling()
 
     @Slot(bool)
     def _on_safe_mode_changed(self, is_safe: bool):
@@ -722,26 +765,160 @@ class MainWindow(QMainWindow):
         if len(vals) == 6:
             if np.max(vals) <= 100.0:
                 self.actual_q = percent_to_length(vals, param_module.L0, param_module.STROKE)
+                actual_pct = vals
             else:
                 self.actual_q = vals
+                actual_pct = length_to_percent(vals, param_module.L0, param_module.STROKE)
+
             # Update telemetry plot with target vs actual
             self.telemetry_plot.update_telemetry(self.current_q, self.actual_q)
+
+            # Actualizar barras de posición real sin mover los sliders
+            if hasattr(self, 'actuator_cluster'):
+                self.actuator_cluster.update_real_positions(actual_pct)
+
+    def read_hardware_position(self):
+        """Pide la posición real al firmware mediante el comando 'getpos'."""
+        if not self.serial_manager.is_connected:
+            self.log_message("sin lectura de posición")
+            return
+        self.serial_manager.request_position()
+
+    def _start_actuator_polling(self):
+        """Inicia polling periódico de getpos cada 500 ms en la pestaña Actuadores."""
+        if self.serial_manager.is_connected and not self.is_tracking:
+            if not self.actuator_poll_timer.isActive():
+                self.actuator_poll_timer.start(500)
+            self.serial_manager.request_position()
+
+    def _stop_actuator_polling(self):
+        """Detiene el polling continuo de getpos."""
+        if self.actuator_poll_timer.isActive():
+            self.actuator_poll_timer.stop()
+
+    def _poll_actuator_position(self):
+        """Callback del timer de 500 ms para solicitar posición real."""
+        if self.serial_manager.is_connected and self.tab_widget.currentIndex() == 2 and not self.is_tracking:
+            self.serial_manager.request_position()
+        else:
+            self._stop_actuator_polling()
+
+    @Slot(list)
+    def _on_real_position_received(self, vals: list):
+        """
+        Recibe la lectura de posición REAL del firmware tras 'getpos'.
+        vals: lista de 6 enteros 0..100 en porcentaje de carrera.
+        No es setpoint, no envía ningún movimiento ni altera los sliders de setpoint.
+        Dibuja los valores en las barras de posición real (relleno L1 a L6), separados del setpoint.
+        """
+        if len(vals) != 6:
+            return
+
+        pct = np.array(vals, dtype=np.float64)
+        l0 = param_module.L0
+        stroke = param_module.STROKE
+        q_mm = percent_to_length(pct, l0, stroke)
+
+        # Actualizar únicamente la posición real medida (feedback de sensores)
+        self.actual_q = q_mm.copy()
+
+        # Dibuja esos 6 valores en las barras de posición real (L1 a L6), separados del setpoint
+        if hasattr(self, 'actuator_cluster'):
+            self.actuator_cluster.update_real_positions(pct)
+
+        # Actualizar gráfica de telemetría (Setpoints vs Real)
+        self.telemetry_plot.update_telemetry(self.current_q, self.actual_q)
+
+    def _on_single_actuator_moved(self, index: int, val: int):
+        """
+        Llamado cuando el usuario mueve un slider individual de actuador (L1..L6).
+        index: 0..5
+        val: 0..100 (%)
+        Envía solo 'aN valor' por serial. Los otros 5 ejes no se mueven.
+        """
+        self.current_pct[index] = float(val)
+        l0 = param_module.L0
+        stroke = param_module.STROKE
+        self.current_q[index] = percent_to_length(float(val), l0, stroke)
+
+        # Enviar comando individual por serial: 'aN valor' (N de 1 a 6)
+        if self.chk_stream.isChecked() and self.serial_manager.is_connected:
+            self.serial_manager.send_single_actuator(index + 1, val)
+
+        # Actualiza la vista 3D con la nueva longitud del actuador
+        self.gl_view.update_platform(self.current_da, self.current_R, self.current_q)
+        self.lbl_sb_pose.setText(f"Actuador L{index + 1} -> {val}% ({self.current_q[index] - l0:.1f} mm)")
+
+    def _send_keep_alive(self):
+        """Manda ping periódico mientras esté conectado."""
+        if self.serial_manager.is_connected and not self.is_tracking:
+            self.serial_manager.send_ping()
 
     # =========================================================================
     # KINEMATICS & CONTROL DISPATCH
     # =========================================================================
     def _on_tab_changed(self, index: int):
+        if self.is_tracking:
+            return
+
         if index == 0:
+            self._stop_actuator_polling()
             self.control_mode = "CARTESIAN"
-            self.badge_mode.set_status("CARTESIANO", "cyan")
-            self._on_cartesian_changed()
+            if hasattr(self, 'spins_pos') and hasattr(self, 'spins_rot'):
+                x = self.spins_pos["X"].value() if "X" in self.spins_pos else 0.0
+                y = self.spins_pos["Y"].value() if "Y" in self.spins_pos else 0.0
+                z = self.spins_pos["Z"].value() if "Z" in self.spins_pos else 0.0
+                roll = self.spins_rot["Roll"].value() if "Roll" in self.spins_rot else 0.0
+                pitch = self.spins_rot["Pitch"].value() if "Pitch" in self.spins_rot else 0.0
+                yaw = self.spins_rot["Yaw"].value() if "Yaw" in self.spins_rot else 0.0
+                is_home = (
+                    abs(x) <= 0.5 and
+                    abs(y) <= 0.5 and
+                    abs(z) <= 0.5 and
+                    abs(roll) <= 0.5 and
+                    abs(pitch) <= 0.5 and
+                    abs(yaw) <= 0.5
+                )
+            else:
+                is_home = True
+
+            if is_home:
+                self.badge_mode.set_status("HOME (0 mm)", "cyan")
+                q_mm, da, R = home_kinematics(D=param_module.D, Az=param_module.Az, Bz=param_module.Bz)
+                self._apply_kinematics_result(q_mm, da, R)
+                self.lbl_sb_pose.setText(
+                    f"HOME (Retraído 0.0 mm / 0%): X: 0.0 Y: 0.0 Z: {da[2]:.1f} | R: 0.0° P: 0.0° Y: 0.0°"
+                )
+            else:
+                self.badge_mode.set_status("CARTESIANO", "cyan")
+                self._on_cartesian_changed()
+
         elif index == 1:
+            self._stop_actuator_polling()
             self.control_mode = "TRACK"
-            self.badge_mode.set_status("TRACK (α/β)", "cyan")
-            self._on_track_angles_changed()
+            if hasattr(self, 'spin_alpha') and hasattr(self, 'spin_beta'):
+                alpha = self.spin_alpha.value()
+                beta = self.spin_beta.value()
+                is_zenith = abs(alpha) <= 0.5 and abs(beta - 90.0) <= 0.5
+            else:
+                is_zenith = True
+
+            if is_zenith:
+                self.badge_mode.set_status("HOME (0 mm)", "cyan")
+                q_mm, da, R = home_kinematics(D=param_module.D, Az=param_module.Az, Bz=param_module.Bz)
+                self._apply_kinematics_result(q_mm, da, R)
+                self.lbl_sb_pose.setText(
+                    f"HOME (Retraído 0.0 mm / 0%): α: 0.0° | β: 90.0° | Z: {da[2]:.2f} mm"
+                )
+            else:
+                self.badge_mode.set_status("TRACK (α/β)", "cyan")
+                self._on_track_angles_changed()
         else:
             self.control_mode = "ACTUATORS"
-            self.badge_mode.set_status("MONITOR L1-L6", "amber")
+            self.badge_mode.set_status("ACTUADORES L1-L6", "amber")
+            if hasattr(self, 'actuator_cluster'):
+                self.actuator_cluster.sync_setpoint_sliders(self.current_pct)
+            self._start_actuator_polling()
 
     def _on_cartesian_changed(self):
         """Called when any Cartesian slider / spinbox changes."""
@@ -755,6 +932,16 @@ class MainWindow(QMainWindow):
         pitch = self.spins_rot["Pitch"].value()
         yaw = self.spins_rot["Yaw"].value()
 
+        if all(abs(v) <= 0.5 for v in (x, y, z, roll, pitch, yaw)):
+            self.badge_mode.set_status("HOME (0 mm)", "cyan")
+            q_mm, da, R = home_kinematics(D=param_module.D, Az=param_module.Az, Bz=param_module.Bz)
+            self._apply_kinematics_result(q_mm, da, R)
+            self.lbl_sb_pose.setText(
+                f"HOME (Retraído 0.0 mm / 0%): X: 0.0 Y: 0.0 Z: {da[2]:.1f} | R: 0.0° P: 0.0° Y: 0.0°"
+            )
+            return
+
+        self.badge_mode.set_status("CARTESIANO", "cyan")
         # Compute Inverse Kinematics (degrees converted automatically)
         q_mm, da, R = pose_to_q(x, y, z, roll, pitch, yaw, deg=True)
         self._apply_kinematics_result(q_mm, da, R)
@@ -868,6 +1055,7 @@ class MainWindow(QMainWindow):
           or L1..L6 directly).
         - Otherwise: executes the 4-phase sequence HOME (0 mm) → APPROACH → TRACK → RETURN → HOME (0 mm).
         """
+        self._stop_actuator_polling()
         pattern = self.combo_traj_pattern.currentText()
         duration = self.spin_traj_dur.value()
         amp_beta = self.spin_traj_amp.value()
@@ -1208,6 +1396,8 @@ class MainWindow(QMainWindow):
         self.traj_progress.setValue(0)
         self.badge_mode.set_status("TRACK (α/β)", "cyan")
         self.log_message("[TRAJ] Trayectoria detenida.")
+        if self.tab_widget.currentIndex() == 2:
+            self._start_actuator_polling()
 
     def _parse_csv_file(self, path: str) -> dict:
         """
@@ -1530,6 +1720,10 @@ class MainWindow(QMainWindow):
     # =========================================================================
     @Slot(str)
     def log_message(self, text: str):
+        if not text:
+            return
+        if text.strip().lower() == "pong":
+            return
         timestamp = time.strftime("%H:%M:%S")
         self.txt_console.append(f"<span style='color: #90A4AE;'>[{timestamp}]</span> {text}")
         # Auto scroll to bottom

@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 from typing import List
 
-from PySide6.QtCore import Q_ARG, QMetaObject, QObject, QThread, QTimer, Qt, Signal
+from PySide6.QtCore import Q_ARG, QMetaObject, QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtSerialPort import QSerialPortInfo
 from connection.serial_worker import SerialWorker
 
@@ -33,6 +33,7 @@ class SerialManager(QObject):
     message_received = Signal(str)
     error_occurred = Signal(str)
     telemetry_received = Signal(list)
+    real_position_received = Signal(list)
     safe_mode_changed = Signal(bool)
 
     def __init__(self, parent=None):
@@ -46,8 +47,15 @@ class SerialManager(QObject):
         self.read_timer.setInterval(25)  # 40 Hz polling
         self.read_timer.timeout.connect(self.worker.process_incoming)
 
+        # Timer de timeout para consulta de posición 'getpos'
+        self._waiting_getpos = False
+        self._getpos_timer = QTimer(self)
+        self._getpos_timer.setInterval(1200)
+        self._getpos_timer.setSingleShot(True)
+        self._getpos_timer.timeout.connect(self._on_getpos_timeout)
+
         self.worker.connected.connect(self._on_worker_connected)
-        self.worker.message_received.connect(self.message_received)
+        self.worker.message_received.connect(self._on_worker_message)
         self.worker.telemetry_received.connect(self.telemetry_received)
         self.worker.error.connect(self.error_occurred)
         self.worker.finished.connect(self.thread.quit)
@@ -58,6 +66,31 @@ class SerialManager(QObject):
         self._safe_mode = True
 
         self.thread.start()
+
+    @Slot(str)
+    def _on_worker_message(self, message: str):
+        if not message:
+            return
+        msg = message.strip()
+        if msg.lower() == "pong":
+            return
+
+        # Parsear respuesta a getpos o telemetría pos: "pos v1,v2,v3,v4,v5,v6"
+        if msg.startswith("pos "):
+            payload = msg[4:].strip()
+            parts = [p.strip() for p in payload.split(",") if p.strip()]
+            if len(parts) == 6:
+                try:
+                    vals = [int(round(float(p))) for p in parts]
+                    if self._waiting_getpos:
+                        self._waiting_getpos = False
+                        self._getpos_timer.stop()
+                    self.real_position_received.emit(vals)
+                    return
+                except ValueError:
+                    pass
+
+        self.message_received.emit(message)
 
     def _on_worker_connected(self, state: bool):
         self._is_connected = state
@@ -141,6 +174,42 @@ class SerialManager(QObject):
             Q_ARG(str, command),
         )
 
+    def request_position(self):
+        """
+        Envía comando 'getpos' al firmware para consultar la posición actual de los 6 actuadores (0..100%).
+        El firmware responde con 'pos v1,v2,v3,v4,v5,v6'.
+        """
+        if not self.is_connected:
+            self.message_received.emit("sin lectura de posición")
+            return
+        if not self._waiting_getpos:
+            self._waiting_getpos = True
+            self._getpos_timer.start(1200)
+        self.send_raw("getpos")
+
+    def get_position(self):
+        """Alias para request_position."""
+        self.request_position()
+
+    def _on_getpos_timeout(self):
+        if self._waiting_getpos:
+            self._waiting_getpos = False
+            self.message_received.emit("sin lectura de posición")
+
+    def send_single_actuator(self, axis_1based: int, value: int | float):
+        """
+        Envía comando individual de un solo actuador: 'aN valor'
+        axis_1based: 1 a 6
+        value: 0 a 100 (%)
+        No envía 'pos' ni mueve los otros 5 ejes.
+        """
+        if not (1 <= axis_1based <= 6):
+            self.error_occurred.emit(f"Eje fuera de rango (1..6): {axis_1based}")
+            return
+        val = int(round(float(value)))
+        val = max(0, min(100, val))
+        self.send_raw(f"a{axis_1based} {val}")
+
     def home(self):
         """Comando de retorno a home."""
         self.send_raw("home")
@@ -161,6 +230,11 @@ class SerialManager(QObject):
 
     def zero_sensors(self):
         self.send_raw("zero")
+
+    def send_ping(self):
+        """Envía ping para mantener viva la conexión en la Arduino."""
+        if self.is_connected:
+            self.send_raw("ping")
 
     def close(self):
         self.read_timer.stop()

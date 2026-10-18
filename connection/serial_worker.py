@@ -83,11 +83,28 @@ class SerialWorker(QObject):
             if cmd == "home":
                 self._target_percent[:] = 0.0
                 self.message_received.emit("[SIM] Recibido: home")
+            elif cmd == "adsinit":
+                self.message_received.emit("[SIM] Recibido: adsinit")
+            elif cmd == "getpos":
+                # Simulated hardware responds with current actual percent
+                vals = [int(round(p)) for p in self._actual_percent]
+                pos_str = "pos " + ",".join(str(v) for v in vals)
+                self.message_received.emit(pos_str)
             elif cmd.startswith("pos "):
                 try:
                     parts = cmd[4:].split(",")
                     if len(parts) == 6:
                         self._target_percent = np.array([float(p) for p in parts], dtype=float)
+                except Exception:
+                    pass
+            elif cmd.startswith("a") and len(cmd) > 1 and cmd[1].isdigit():
+                try:
+                    parts = cmd.split()
+                    axis = int(parts[0][1:]) - 1
+                    val = float(parts[1])
+                    if 0 <= axis < 6:
+                        self._target_percent[axis] = np.clip(val, 0.0, 100.0)
+                        self.message_received.emit(f"[SIM] Recibido: a{axis+1} {int(round(val))}")
                 except Exception:
                     pass
             return
