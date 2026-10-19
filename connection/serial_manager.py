@@ -72,7 +72,7 @@ class SerialManager(QObject):
         if not message:
             return
         msg = message.strip()
-        if msg.lower() == "pong":
+        if msg.lower() == "pong" or msg.startswith("TEL") or msg.startswith("FEEDBACK"):
             return
 
         # Parsear respuesta a getpos o telemetría pos: "pos v1,v2,v3,v4,v5,v6"
