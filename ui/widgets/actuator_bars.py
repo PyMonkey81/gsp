@@ -6,7 +6,7 @@ Redesigned with independent setpoint sliders and separate real feedback indicato
 from typing import List, Union
 import numpy as np
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QProgressBar, QSlider, QSpinBox, QFrame
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QProgressBar, QSlider, QSpinBox, QFrame
 )
 from PySide6.QtCore import Qt, Signal
 
@@ -21,11 +21,12 @@ from ui.styles import (
 
 class SingleActuatorBar(QFrame):
     """
-    Individual Actuator Card with:
-    - Compact Header: L{i} | SP: % (mm) | Real: % (mm) | Safety Status
-    - Independent Setpoint Slider (0–100%) + QSpinBox
-    - Separate Real Position Feedback Bar (Emerald)
-    - Limits guide: 0% (0 mm) ... 50% ... 100% (STROKE mm)
+    Individual Actuator Card optimized for 2x3 Grid Layout:
+    - Row 1: L{i} | (L: total mm) ---> Safety Status
+    - Row 2: SP: % (mm) ---> Real: % (mm)
+    - Row 3: Independent Setpoint Slider (0–100%) + QSpinBox
+    - Row 4: Real Position Feedback Bar (Emerald)
+    - Row 5: Limits guide: 0% ... 50% ... 100%
     """
     slider_changed = Signal(int, int)  # (index: 0..5, value: 0..100)
 
@@ -35,52 +36,61 @@ class SingleActuatorBar(QFrame):
         self._stroke = float(_params.STROKE)
         self._l0 = float(_params.L0)
 
+        self.setObjectName("ActuatorCard")
         self.setStyleSheet(f"""
-            QFrame {{
+            QFrame#ActuatorCard {{
                 background-color: {COLOR_CARD_BG};
                 border: 1px solid {COLOR_BORDER};
                 border-radius: 6px;
-                padding: 4px 8px;
+            }}
+            QFrame#ActuatorCard QLabel {{
+                background: transparent;
+                border: none;
+                padding: 0px;
             }}
         """)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 4, 6, 4)
+        layout.setContentsMargins(8, 6, 8, 6)
         layout.setSpacing(4)
 
-        # 1. Header Row: L{i} + SP: % (mm) + L: mm + Real: % (mm) + Status
-        hdr_layout = QHBoxLayout()
-        hdr_layout.setContentsMargins(0, 0, 0, 0)
-        hdr_layout.setSpacing(8)
+        # 1. Top Header Row: L{i} + Total Length (L: mm) + Safety Status aligned right
+        hdr_top = QHBoxLayout()
+        hdr_top.setContentsMargins(0, 0, 0, 0)
+        hdr_top.setSpacing(6)
 
         self.lbl_id = QLabel(f"L{index + 1}")
         self.lbl_id.setStyleSheet(f"font-weight: 800; font-size: 13px; color: {COLOR_CYAN};")
-        hdr_layout.addWidget(self.lbl_id)
+        hdr_top.addWidget(self.lbl_id)
 
-        # Setpoint Readout
+        self.lbl_sp_len = QLabel(f"(L: {self._l0:.1f} mm)")
+        self.lbl_sp_len.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 10px; color: {COLOR_TEXT_MUTED};")
+        hdr_top.addWidget(self.lbl_sp_len)
+
+        hdr_top.addStretch()
+
+        self.lbl_status = QLabel("HOME (0 mm)")
+        self.lbl_status.setStyleSheet(f"font-weight: 700; font-size: 10px; color: {COLOR_EMERALD};")
+        hdr_top.addWidget(self.lbl_status)
+
+        layout.addLayout(hdr_top)
+
+        # 2. Telemetry Readout Row: Setpoint (SP) on left, Real Position on right
+        readout_row = QHBoxLayout()
+        readout_row.setContentsMargins(0, 0, 0, 0)
+        readout_row.setSpacing(6)
+
         self.lbl_sp = QLabel("SP: 0% (0.0 mm)")
         self.lbl_sp.setStyleSheet(f"""
             font-family: {FONT_MONO};
-            font-size: 12px;
+            font-size: 11px;
             font-weight: 700;
             color: {COLOR_TEXT_PRIMARY};
         """)
-        hdr_layout.addWidget(self.lbl_sp)
+        readout_row.addWidget(self.lbl_sp)
 
-        self.lbl_sp_len = QLabel(f"(L: {self._l0:.1f} mm)")
-        self.lbl_sp_len.setStyleSheet(f"""
-            font-family: {FONT_MONO};
-            font-size: 10px;
-            color: {COLOR_TEXT_MUTED};
-        """)
-        hdr_layout.addWidget(self.lbl_sp_len)
+        readout_row.addStretch()
 
-        # Separator dot
-        lbl_dot = QLabel("•")
-        lbl_dot.setStyleSheet(f"color: {COLOR_BORDER_LIGHT}; font-size: 10px;")
-        hdr_layout.addWidget(lbl_dot)
-
-        # Real Position Readout (shown separately, never overwritten by slider)
         self.lbl_real = QLabel("Real: --")
         self.lbl_real.setStyleSheet(f"""
             font-family: {FONT_MONO};
@@ -88,41 +98,34 @@ class SingleActuatorBar(QFrame):
             font-weight: 700;
             color: {COLOR_EMERALD};
         """)
-        hdr_layout.addWidget(self.lbl_real)
+        readout_row.addWidget(self.lbl_real)
 
-        hdr_layout.addStretch()
+        layout.addLayout(readout_row)
 
-        # Safety State Tag (aligned to far right)
-        self.lbl_status = QLabel("HOME (0 mm)")
-        self.lbl_status.setStyleSheet(f"font-weight: 700; font-size: 10px; color: {COLOR_EMERALD};")
-        hdr_layout.addWidget(self.lbl_status)
-
-        layout.addLayout(hdr_layout)
-
-        # 2. Setpoint Control Row: Slider (0..100) + SpinBox (0..100)
+        # 3. Setpoint Control Row: Slider (0..100) + SpinBox (0..100)
         ctrl_layout = QHBoxLayout()
         ctrl_layout.setContentsMargins(0, 0, 0, 0)
-        ctrl_layout.setSpacing(8)
+        ctrl_layout.setSpacing(6)
 
         self.slider = QSlider(Qt.Orientation.Horizontal)
         self.slider.setRange(0, 100)
         self.slider.setValue(0)
         self.slider.setTracking(True)
-        self.slider.setFixedHeight(22)
-        ctrl_layout.addWidget(self.slider)
+        self.slider.setFixedHeight(20)
+        ctrl_layout.addWidget(self.slider, stretch=1)
 
         self.spin = QSpinBox()
         self.spin.setRange(0, 100)
         self.spin.setValue(0)
         self.spin.setSuffix(" %")
-        self.spin.setFixedWidth(68)
+        self.spin.setFixedWidth(62)
         self.spin.setFixedHeight(22)
         self.spin.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 11px;")
         ctrl_layout.addWidget(self.spin)
 
         layout.addLayout(ctrl_layout)
 
-        # 3. Real Position Feedback Bar (Emerald Green, distinct from Cyan Setpoint)
+        # 4. Real Position Feedback Bar (Emerald Green, distinct from Cyan Setpoint)
         real_layout = QHBoxLayout()
         real_layout.setContentsMargins(0, 0, 0, 0)
         real_layout.setSpacing(6)
@@ -149,18 +152,16 @@ class SingleActuatorBar(QFrame):
                 border-radius: 3px;
             }}
         """)
-        real_layout.addWidget(self.real_bar)
+        real_layout.addWidget(self.real_bar, stretch=1)
 
-        # Spacer to align with spinbox in row above
-        real_layout.addSpacing(74)
         layout.addLayout(real_layout)
 
-        # 4. Limits Indicator Row
+        # 5. Compact Limits Indicator Row
         lim_layout = QHBoxLayout()
-        lim_layout.setContentsMargins(34, 0, 74, 0)
-        self.lbl_min = QLabel("0% (0 mm)")
-        self.lbl_nom = QLabel(f"50% ({self._stroke * 0.5:.0f} mm)")
-        self.lbl_max = QLabel(f"100% ({self._stroke:.0f} mm)")
+        lim_layout.setContentsMargins(0, 0, 0, 0)
+        self.lbl_min = QLabel("0% (0mm)")
+        self.lbl_nom = QLabel(f"50% ({self._stroke * 0.5:.0f}mm)")
+        self.lbl_max = QLabel(f"100% ({self._stroke:.0f}mm)")
 
         for l in (self.lbl_min, self.lbl_nom, self.lbl_max):
             l.setStyleSheet(f"font-size: 9px; color: {COLOR_TEXT_MUTED}; font-family: {FONT_MONO};")
@@ -200,24 +201,30 @@ class SingleActuatorBar(QFrame):
         self.lbl_sp.setText(f"SP: {pct:.0f}% ({ext_mm:.1f} mm)")
         self.lbl_sp_len.setText(f"(L: {total_mm:.1f} mm)")
 
+        # Update limit labels if STROKE changed dynamically
+        if abs(stroke - self._stroke) > 1e-3:
+            self._stroke = stroke
+            self.lbl_nom.setText(f"50% ({stroke * 0.5:.0f}mm)")
+            self.lbl_max.setText(f"100% ({stroke:.0f}mm)")
+
         # Safety evaluation
         tol = 0.5
         if ext_mm < -tol or ext_mm > stroke + tol:
             self.lbl_status.setText("LÍMITE EXCEDIDO")
             self.lbl_status.setStyleSheet(f"font-weight: 700; font-size: 10px; color: {COLOR_EMERGENCY};")
-            self.lbl_sp.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 12px; font-weight: 700; color: {COLOR_EMERGENCY};")
+            self.lbl_sp.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 11px; font-weight: 700; color: {COLOR_EMERGENCY};")
         elif ext_mm > stroke - SAFE_MARGIN:
             self.lbl_status.setText("CERCA DE LÍMITE")
             self.lbl_status.setStyleSheet(f"font-weight: 700; font-size: 10px; color: {COLOR_WARNING};")
-            self.lbl_sp.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 12px; font-weight: 700; color: {COLOR_WARNING};")
+            self.lbl_sp.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 11px; font-weight: 700; color: {COLOR_WARNING};")
         elif abs(ext_mm) <= 0.15:
             self.lbl_status.setText("HOME (0 mm)")
             self.lbl_status.setStyleSheet(f"font-weight: 700; font-size: 10px; color: {COLOR_EMERALD};")
-            self.lbl_sp.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 12px; font-weight: 700; color: {COLOR_TEXT_PRIMARY};")
+            self.lbl_sp.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 11px; font-weight: 700; color: {COLOR_TEXT_PRIMARY};")
         else:
             self.lbl_status.setText("SEGURO")
             self.lbl_status.setStyleSheet(f"font-weight: 700; font-size: 10px; color: {COLOR_EMERALD};")
-            self.lbl_sp.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 12px; font-weight: 700; color: {COLOR_TEXT_PRIMARY};")
+            self.lbl_sp.setStyleSheet(f"font-family: {FONT_MONO}; font-size: 11px; font-weight: 700; color: {COLOR_TEXT_PRIMARY};")
 
     def set_setpoint(self, pct: float, total_mm: float = None):
         """Actualiza el slider y setpoint de la UI con señales bloqueadas (no emite comando serial)."""
@@ -272,22 +279,32 @@ class SingleActuatorBar(QFrame):
 
 class ActuatorClusterWidget(QWidget):
     """
-    Contenedor de los 6 controles independientes de actuador (L1..L6).
+    Contenedor de los 6 controles independientes de actuador (L1..L6) en cuadrícula 2x3:
+    Columna Izquierda: L1, L2, L3
+    Columna Derecha:   L4, L5, L6
+    Siempre visible sin barras de desplazamiento (scrollbars).
     """
     actuator_moved = Signal(int, int)  # (index: 0..5, value: 0..100)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(6)
+        grid = QGridLayout(self)
+        grid.setContentsMargins(2, 2, 2, 2)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(8)
 
         self.bars: List[SingleActuatorBar] = []
         for i in range(6):
             bar = SingleActuatorBar(i, self)
             bar.slider_changed.connect(self._on_bar_slider_changed)
             self.bars.append(bar)
-            layout.addWidget(bar)
+            # L1, L2, L3 en columna 0 (filas 0, 1, 2); L4, L5, L6 en columna 1 (filas 0, 1, 2)
+            col = 0 if i < 3 else 1
+            row = i % 3
+            grid.addWidget(bar, row, col)
+
+        grid.setColumnStretch(0, 1)
+        grid.setColumnStretch(1, 1)
 
     def _on_bar_slider_changed(self, index: int, val: int):
         self.actuator_moved.emit(index, val)

@@ -136,9 +136,10 @@ class MainWindow(QMainWindow):
 
         # 3. Panel Derecho con QTabWidget
         self._build_right_control_tabs()
+        self.tab_widget.setMinimumWidth(520)
         top_hsplitter.addWidget(self.tab_widget)
-        top_hsplitter.setSizes([920, 480])
-        top_hsplitter.setStretchFactor(0, 1)  # gl_view takes maximum horizontal space
+        top_hsplitter.setSizes([760, 620])
+        top_hsplitter.setStretchFactor(0, 1)  # gl_view takes remaining horizontal space
         top_hsplitter.setStretchFactor(1, 0)
 
         main_vsplitter.addWidget(top_hsplitter)
@@ -177,46 +178,46 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         # Serial Port Selector
-        lbl_port = QLabel("PUERTO:")
-        lbl_port.setStyleSheet(f"font-weight: 700; font-size: 10px; color: {COLOR_CYAN};")
-        layout.addWidget(lbl_port)
+        # lbl_port = QLabel("PUERTO:")
+        # lbl_port.setStyleSheet(f"font-weight: 700; font-size: 10px; color: {COLOR_CYAN};")
+        # layout.addWidget(lbl_port)
 
-        self.combo_ports = QComboBox()
-        self.combo_ports.setMinimumWidth(180)
-        self.refresh_ports()
-        layout.addWidget(self.combo_ports)
+        # self.combo_ports = QComboBox()
+        # self.combo_ports.setMinimumWidth(180)
+        # self.refresh_ports()
+        # layout.addWidget(self.combo_ports)
 
-        btn_refresh = QPushButton("↻")
-        btn_refresh.setFixedWidth(28)
-        btn_refresh.setToolTip("Refrescar puertos disponibles")
-        btn_refresh.clicked.connect(self.refresh_ports)
-        layout.addWidget(btn_refresh)
+        # btn_refresh = QPushButton("↻")
+        # btn_refresh.setFixedWidth(28)
+        # btn_refresh.setToolTip("Refrescar puertos disponibles")
+        # btn_refresh.clicked.connect(self.refresh_ports)
+        # layout.addWidget(btn_refresh)
 
-        # Baudrate Selector
-        self.combo_baud = QComboBox()
-        for b in AVAILABLE_BAUDRATES:
-            self.combo_baud.addItem(str(b))
-        self.combo_baud.setCurrentText(str(DEFAULT_BAUDRATE))
-        self.combo_baud.setFixedWidth(85)
-        layout.addWidget(self.combo_baud)
+        # # Baudrate Selector
+        # self.combo_baud = QComboBox()
+        # for b in AVAILABLE_BAUDRATES:
+        #     self.combo_baud.addItem(str(b))
+        # self.combo_baud.setCurrentText(str(DEFAULT_BAUDRATE))
+        # self.combo_baud.setFixedWidth(85)
+        # layout.addWidget(self.combo_baud)
 
-        # Connect / Disconnect Button
-        self.btn_connect = QPushButton("CONECTAR")
-        self.btn_connect.setObjectName("PrimaryButton")
-        self.btn_connect.setFixedWidth(100)
-        self.btn_connect.clicked.connect(self._toggle_connection)
-        layout.addWidget(self.btn_connect)
+        # # Connect / Disconnect Button
+        # self.btn_connect = QPushButton("CONECTAR")
+        # self.btn_connect.setObjectName("PrimaryButton")
+        # self.btn_connect.setFixedWidth(100)
+        # self.btn_connect.clicked.connect(self._toggle_connection)
+        # layout.addWidget(self.btn_connect)
 
         # Serial Config Dialog Button
         self.btn_serial_config = QPushButton("⚙ CONFIG")
-        self.btn_serial_config.setFixedWidth(75)
+        self.btn_serial_config.setFixedWidth(120)
         self.btn_serial_config.setToolTip("Configuración de comunicación serial y simulador")
         self.btn_serial_config.clicked.connect(self.open_serial_config)
         layout.addWidget(self.btn_serial_config)
 
         # Read Hardware Position Button
         self.btn_read_pos = QPushButton("📍 LEER POS")
-        self.btn_read_pos.setFixedWidth(90)
+        self.btn_read_pos.setFixedWidth(130)
         self.btn_read_pos.setToolTip("Consultar posición actual al firmware ('getpos')")
         self.btn_read_pos.clicked.connect(self.read_hardware_position)
         layout.addWidget(self.btn_read_pos)
@@ -239,11 +240,11 @@ class MainWindow(QMainWindow):
         self.chk_stream.setStyleSheet("font-size: 10px; font-weight: 600; color: #90A4AE;")
         layout.addWidget(self.chk_stream)
 
-        # Parameters Dialog Button
-        self.btn_parameters = QPushButton("📐 PARÁMETROS")
-        self.btn_parameters.setToolTip("Configuración de parámetros del sistema (Geometría, Actuadores, Trayectoria, Az/Bz)")
-        self.btn_parameters.clicked.connect(self.open_parameter_dialog)
-        layout.addWidget(self.btn_parameters)
+        # # Parameters Dialog Button
+        # self.btn_parameters = QPushButton("📐 PARÁMETROS")
+        # self.btn_parameters.setToolTip("Configuración de parámetros del sistema (Geometría, Actuadores, Trayectoria, Az/Bz)")
+        # self.btn_parameters.clicked.connect(self.open_parameter_dialog)
+        # layout.addWidget(self.btn_parameters)
 
         # Home Button
         self.btn_home = QPushButton("⌂ HOME")
@@ -543,7 +544,7 @@ class MainWindow(QMainWindow):
 
     def _build_tab_actuators(self):
         layout = QVBoxLayout(self.tab_actuators)
-        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
 
         # Header toolbar for Actuators tab
@@ -562,8 +563,7 @@ class MainWindow(QMainWindow):
 
         self.actuator_cluster = ActuatorClusterWidget()
         self.actuator_cluster.actuator_moved.connect(self._on_single_actuator_moved)
-        layout.addWidget(self.actuator_cluster)
-        layout.addStretch()
+        layout.addWidget(self.actuator_cluster, stretch=1)
 
     # =========================================================================
     # 4. PANEL INFERIOR-IZQUIERDO (Telemetría y Jacobiano)
@@ -655,7 +655,7 @@ class MainWindow(QMainWindow):
         btn_bar.addWidget(self.btn_params_bottom)
 
         btn_clear_log = QPushButton("Limpiar Log")
-        btn_clear_log.setFixedHeight(22)
+        # btn_clear_log.setFixedHeight(22)
         btn_clear_log.clicked.connect(self._clear_logs)
         btn_bar.addWidget(btn_clear_log)
 
@@ -710,6 +710,8 @@ class MainWindow(QMainWindow):
     # SERIAL ACTIONS & PORTS
     # =========================================================================
     def refresh_ports(self):
+        if not hasattr(self, "combo_ports"):
+            return
         current = self.combo_ports.currentText()
         self.combo_ports.clear()
         ports = self.serial_manager.available_ports()
@@ -720,7 +722,7 @@ class MainWindow(QMainWindow):
     def _toggle_connection(self):
         if self.serial_manager.is_connected:
             self.serial_manager.disconnect_port()
-        else:
+        elif hasattr(self, "combo_ports") and hasattr(self, "combo_baud"):
             port = self.combo_ports.currentText()
             baud = int(self.combo_baud.currentText())
             if not port:
@@ -730,8 +732,9 @@ class MainWindow(QMainWindow):
 
     @Slot(str, int)
     def _on_serial_connected(self, port: str, baud: int):
-        self.btn_connect.setText("DESCONECTAR")
-        self.btn_connect.setStyleSheet(f"background-color: {COLOR_EMERGENCY}; border: 1px solid #FF5252;")
+        if hasattr(self, "btn_connect"):
+            self.btn_connect.setText("DESCONECTAR")
+            self.btn_connect.setStyleSheet(f"background-color: {COLOR_EMERGENCY}; border: 1px solid #FF5252;")
         self.badge_conn.set_status("CONECTADO", "green")
         self.log_message(f"[SERIAL] Conectado a {port} a {baud} baudios.")
         self.ping_timer.start()
@@ -745,8 +748,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_serial_disconnected(self):
-        self.btn_connect.setText("CONECTAR")
-        self.btn_connect.setStyleSheet("")
+        if hasattr(self, "btn_connect"):
+            self.btn_connect.setText("CONECTAR")
+            self.btn_connect.setStyleSheet("")
         self.badge_conn.set_status("DESCONECTADO", "red")
         self.log_message("[SERIAL] Desconectado.")
         self.ping_timer.stop()
