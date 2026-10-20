@@ -1,15 +1,19 @@
 # Manual de Conexión Física e Integración
-## Plataforma Gough-Stewart 6-DOF (Arduino GIGA R1 + Actuonix LAC + ADS1256 + L16-P)
+## Plataforma Gough-Stewart 6-DOF (Control Directo por USB: Hub 6 Puertos + 6x Actuonix LAC + L16-P)
 
 ---
 
 ## 1. Lista de Componentes del Sistema
 
-* **Controlador Principal:** Arduino GIGA R1 WiFi (lógica de 3.3 V) + GIGA Display Shield.
-* **Actuadores Lineales (6x):** Actuonix **L16-100-35-12-P** (100 mm de carrera, relación 35:1, 12 V DC, con retroalimentación por potenciómetro).
-* **Tarjetas de Control (6x):** Actuonix **LAC** (Linear Actuator Control Board).
-* **Convertidor Analógico-Digital (1x):** Módulo **ADS1256** de 24 bits y 8 canales (placa verde).
-* **Fuente de Alimentación:** Fuente de **12 V DC / 2.5 A** (con `GND` común para todo el sistema).
+* **PC de Control:** Aplicación Python (`main.py`) con comunicación USB directa de 10 bits (`0..1023`).
+* **Hub USB (1x):** Hub USB de 6 o más puertos (recomendado con alimentación externa) conectado a un puerto USB de la PC.
+* **Cables USB (6x):** 6 cables **USB-A a Mini-USB** (uno para cada tarjeta LAC).
+* **Tarjetas de Control (6x):** Actuonix **LAC** (Linear Actuator Control Board, `VID=0x04D8`, `PID=0xFC5F`).
+* **Actuadores Lineales (6x):** Actuonix **L16-100-35-12-P** (100 mm de carrera, relación 35:1, 12 V DC, con retroalimentación interna por potenciómetro).
+* **Fuente de Alimentación:** Fuente de **12 V DC** conectada únicamente a las borneras de potencia `X6.+` y `X6.-` de las 6 tarjetas LAC.
+
+> [!NOTE]
+> **Eliminación de hardware intermedio:** En esta arquitectura ya **no se utilizan** el Arduino GIGA R1, el GIGA Display Shield ni el módulo ADS1256. Tampoco se cablean señales PWM (`X6.VC`) ni salidas analógicas de potenciómetro (`X4.P`) hacia el exterior; tanto la consigna como la retroalimentación de posición viajan digitalmente por el cable Mini-USB de cada tarjeta LAC.
 
 ---
 
@@ -17,150 +21,73 @@
 
 ```mermaid
 flowchart LR
-    subgraph PSU["1. Fuente 12V DC (2.5A)"]
+    subgraph PC["1. PC (App Python 6-DOF)"]
+        APP["Cinematica + Trayectorias + GUI 3D"]
+        DRV["Driver USB LAC (PyUSB 3-byte packets)"]
+        APP <==> DRV
+    end
+
+    subgraph HUB["2. Hub USB (6 Puertos)"]
+        USB_PORTS["Puertos USB #1 a #6 (Mini-USB)"]
+    end
+
+    subgraph PSU["3. Fuente 12V DC"]
         V12["Positivo (+12V)"]
-        GND_BUS["Tierra Común (GND / -)"]
+        GND_BUS["Negativo / Tierra (GND / -)"]
     end
 
-    subgraph GIGA["2. Arduino GIGA R1"]
-        VIN["Pin VIN"]
-        GGND["Pin GND"]
-        P5V["Pin 5V (OUT)"]
-        P3V3["Pin 3.3V (OUT)"]
-        PWM["Salidas PWM: D2 a D7"]
-        SPI1_PINS["SPI1: D10, D11, D12, D13 + D8, D9"]
+    subgraph LACS["4. Tarjetas Actuonix LAC (L1 a L6)"]
+        USB_CON["Conector Mini-USB (Consigna + Feedback ADC)"]
+        X6_PWR["Bornera X6: + (12V) y - (GND)"]
+        X2_ACT["Cabezal X2 (5 pines hacia Actuador)"]
     end
 
-    subgraph LAC["3. Tarjetas Actuonix LAC (#1 a #6)"]
-        X6_POS["Bornera X6.+ (Pin 2)"]
-        X6_NEG["Bornera X6.- (Pin 1)"]
-        X6_VC["Bornera X6.VC (Pin 5)"]
-        X2_CON["Cabezal X2 (5 pines)"]
-        X4_P["Bornera X4.P (Pin 2)"]
+    subgraph ACTS["5. Actuadores L16-100-35-12-P (x6)"]
+        MOT_POT["Motor 12V + Potenciómetro Interno"]
     end
 
-    subgraph ACT["4. Actuadores L16-100-35-12-P"]
-        CABLE["Conector hembra 5 pines"]
-    end
-
-    subgraph ADS["5. Módulo ADS1256 (24-bit)"]
-        ADS_PWR["VCC, GND, PDWN"]
-        ADS_SPI["SCLK, Din, Dout, CS, DRDY, RST"]
-        AIN_COM["Columna Izq: AINCOM"]
-        AIN_CH["Columna Der: AIN0 a AIN5"]
-    end
-
-    V12 --> VIN
-    V12 --> X6_POS
-    GND_BUS --- GGND
-    GND_BUS --- X6_NEG
-    GND_BUS --- ADS_PWR
-    GND_BUS --- AIN_COM
-
-    P5V -->|"5V"| ADS_PWR
-    P3V3 -->|"3.3V a PDWN"| ADS_PWR
-    PWM -->|"D2..D7 (PWM 3.3V)"| X6_VC
-    X2_CON <==>|"Directo (Amarillo arriba)"| CABLE
-    X4_P -->|"Señal 0 a 3.3V"| AIN_CH
-    SPI1_PINS <==>|"Bus SPI1"| ADS_SPI
+    DRV <==>|"1 Cable USB a PC"| USB_PORTS
+    USB_PORTS <==>|"6 Cables Mini-USB"| USB_CON
+    V12 -->|"12V Potencia"| X6_PWR
+    GND_BUS -->|"GND Potencia"| X6_PWR
+    X2_ACT <==>|"Conector 5 pines (*Yellow arriba)"| MOT_POT
 ```
 
 ---
 
-## 3. Paso 1: Alimentación y Tierra Común (`GND`)
+## 3. Paso 1: Conexión de Alimentación (`12V`) y Actuador en cada Tarjeta LAC
 
-Toda la electrónica debe compartir la misma referencia de tierra (`GND`):
+Para cada una de las 6 tarjetas Actuonix LAC (`L1` a `L6`):
 
-| Origen (Fuente / Arduino) | Destino | Cable / Terminal | Nota de Seguridad |
-| :--- | :--- | :--- | :--- |
-| **Fuente `+12V`** | **Arduino GIGA** | Pin **`VIN`** | Alimenta la Arduino GIGA. |
-| **Fuente `+12V`** | **Tarjetas LAC (#1 a #6)** | Bornera **`X6.+`** (Pin 2 de X6) | Alimentación de potencia para los motores de 12 V. |
-| **Fuente `GND` (`-`)** | **Arduino GIGA** | Pin **`GND`** | Tierra principal de referencia. |
-| **Fuente `GND` (`-`)** | **Tarjetas LAC (#1 a #6)** | Bornera **`X6.-`** (Pin 1 de X6) | Tierra de potencia y señal de cada tarjeta LAC. |
-| **Arduino `GND`** | **Módulo ADS1256** | Pin **`GND`** (lado izquierdo) | Tierra de alimentación del módulo ADS1256. |
-| **Arduino `GND`** | **Módulo ADS1256** | Pin **`AINCOM`** (columna izquierda de pines amarillos derechos) | **¡Indispensable!** Referencia de 0 V para los canales `AIN0–AIN7`. |
-
----
-
-## 4. Paso 2: Conexión del Actuador `L16-100-35-12-P` a la Tarjeta `LAC`
-
-En la tarjeta Actuonix LAC, el conector blanco/negro de 5 pines **`X2`** y la bornera verde de tornillos **`X4`** están unidos internamente en paralelo sobre la placa.
-
-1. **Conectar el actuador L16-100-35-12-P directo en `X2`:**
-   * Enchufa el conector de 5 pines del actuador directamente en el cabezal **`X2`** de la LAC.
+1. **Alimentación de potencia (`X6.+` y `X6.-`):**
+   * Conecta el positivo **`+12V`** de tu fuente al tornillo **`+` (Pin 2 de la bornera X6)**.
+   * Conecta el negativo **`GND (-)`** de tu fuente al tornillo **`-` (Pin 1 de la bornera X6)**.
+   * Deja libres los tornillos `VC`, `IC` y `RC` de `X6` (el comando USB `0x20 SET_POSITION` deshabilita automáticamente las entradas analógicas/RC).
+2. **Conexión del actuador `L16-100-35-12-P` en `X2`:**
+   * Enchufa el conector hembra de 5 pines del actuador directamente en el cabezal **`X2`** de su tarjeta LAC.
    * **Orientación obligatoria:** El cable **Amarillo** del actuador debe quedar hacia arriba, alineado con la marca **`*Yellow`** impresa en la placa LAC.
-2. **Salida de lectura de posición desde `X4.P`:**
-   * De la bornera verde **`X4`**, **solo vas a utilizar el tornillo `P` (Pin 2 de X4)**.
-   * Internamente, la tarjeta LAC ya alimenta el potenciómetro del actuador con 3.3 V a través de `X2`, y por el tornillo **`X4.P`** sale directamente el voltaje de posición (**0 V a 3.3 V**) hacia el ADS1256.
-   * *(No necesitas conectar nada en `X4.P+`, `X4.M+`, `X4.M-` ni `X4.P-` porque ya van por el conector `X2`).*
+   * Deja totalmente libre la bornera `X4` (la tarjeta LAC lee el potenciómetro internamente a través de `X2` y entrega el valor digital de 10 bits por USB).
+3. **Conexión Mini-USB:**
+   * Conecta cada tarjeta LAC a un puerto del Hub USB mediante su cable Mini-USB.
 
 ---
 
-## 5. Paso 3: Conexión de los 6 Ejes (`Arduino GIGA` $\rightarrow$ `LAC` $\rightarrow$ `ADS1256`)
+## 4. Paso 2: Asignación Única de ID (`1` a `6`) para cada Tarjeta LAC
 
-> [!IMPORTANT]
-> **Atención en el cabezal amarillo derecho del ADS1256 ($2 \times 8$ pines):**
-> * **Columna Izquierda (`AINCOM`):** Los 8 pines de la columna izquierda están unidos entre sí. Conecta **1 solo cable desde `GND` de la Arduino** a cualquiera de los pines de esta columna izquierda.
-> * **Columna Derecha (`AIN0` a `AIN7`):** Aquí entran los cables que vienen de **`X4.P`** de cada tarjeta LAC (`AIN0` es el pin de hasta abajo y `AIN7` el de hasta arriba).
+Dado que Windows puede enumerar los puertos de un Hub USB en distinto orden al reiniciar la PC, las tarjetas LAC disponen del comando **`0x50 SET_SERIAL_NUM`** (guardado en su memoria EEPROM) y **`0x51 GET_SERIAL_NUM`** (página 10 del datasheet):
 
-| Eje | Salida PWM Arduino GIGA | Entrada Control en LAC (`X6`) | Salida Posición en LAC (`X4`) | Entrada Analógica en ADS1256 *(Columna Derecha)* | Respaldo Analógico GIGA *(Opcional)* |
-| :---: | :---: | :---: | :---: | :---: | :---: |
-| **Eje 1 (`L1`)** | Pin **`D2`** | `LAC #1` $\rightarrow$ Tornillo **`X6.VC`** | `LAC #1` $\rightarrow$ Tornillo **`X4.P`** | **`AIN0`** *(Columna Derecha, abajo)* | `A0` |
-| **Eje 2 (`L2`)** | Pin **`D3`** | `LAC #2` $\rightarrow$ Tornillo **`X6.VC`** | `LAC #2` $\rightarrow$ Tornillo **`X4.P`** | **`AIN1`** *(Columna Derecha)* | `A1` |
-| **Eje 3 (`L3`)** | Pin **`D4`** | `LAC #3` $\rightarrow$ Tornillo **`X6.VC`** | `LAC #3` $\rightarrow$ Tornillo **`X4.P`** | **`AIN2`** *(Columna Derecha)* | `A2` |
-| **Eje 4 (`L4`)** | Pin **`D5`** | `LAC #4` $\rightarrow$ Tornillo **`X6.VC`** | `LAC #4` $\rightarrow$ Tornillo **`X4.P`** | **`AIN3`** *(Columna Derecha)* | `A3` |
-| **Eje 5 (`L5`)** | Pin **`D6`** | `LAC #5` $\rightarrow$ Tornillo **`X6.VC`** | `LAC #5` $\rightarrow$ Tornillo **`X4.P`** | **`AIN4`** *(Columna Derecha)* | `A4` |
-| **Eje 6 (`L6`)** | Pin **`D7`** | `LAC #6` $\rightarrow$ Tornillo **`X6.VC`** | `LAC #6` $\rightarrow$ Tornillo **`X4.P`** | **`AIN5`** *(Columna Derecha)* | `A5` |
+1. Cuando recibas el Hub y los cables Mini-USB, abre la aplicación (`python main.py`) y haz clic en el botón superior **`⚙ CONFIG USB`**.
+2. Para identificarlas fácilmente la primera vez, puedes conectar las tarjetas **una por una** al Hub USB (o conectar las 6 e ir probando):
+   * Haz clic en **`↻ Escanear USB`** y luego en **`CONECTAR`**.
+   * En la sección **"2. Identificación de Tarjetas en el Hub (0x50 SET_SERIAL_NUM)"**, selecciona la tarjeta detectada, elige a qué actuador físico corresponde (**`Actuador L1 (Serial ID = 1)`** hasta **`Actuador L6 (Serial ID = 6)`**) y presiona **`Grabar ID (0x50)`**.
+3. ¡Listo! Ese número (`1` a `6`) queda guardado permanentemente en la EEPROM de cada tarjeta LAC. A partir de ese momento, **no importa en qué puerto del Hub USB enchufes cada cable**: al abrir la app, el sistema interroga las 6 tarjetas con `0x51 GET_SERIAL_NUM` y asigna automáticamente cada una a su eje `L1..L6`.
 
 ---
 
-## 6. Paso 4: Conexión Digital y Alimentación `ADS1256` $\leftrightarrow$ `Arduino GIGA R1`
+## 5. Funcionamiento Automático al Iniciar la Aplicación
 
-Conecta los 10 pines del cabezal amarillo izquierdo del módulo **ADS1256** (de arriba hacia abajo según la serigrafía de la placa) hacia el **Arduino GIGA R1**:
-
-| Orden (Arriba $\rightarrow$ Abajo) | Pin en ADS1256 (Lado Izquierdo) | Pin en Arduino GIGA R1 | Función y Observaciones |
-| :---: | :--- | :--- | :--- |
-| **1** | **`GND`** | **`GND`** | Tierra común del sistema. |
-| **2** | **`VCC`** | **`5V`** | Alimentación de 5 V para el regulador y referencia `REF03` (2.5 V) del ADS1256. |
-| **3** | **`NC`** | *Sin conectar* | Dejar libre. |
-| **4** | **`RST`** | **`D8`** | Reset físico del ADS1256 controlado por el Arduino. |
-| **5** | **`CS`** | **`D10`** (`SPI5_NSS`) | Selección de chip SPI (Chip Select). |
-| **6** | **`DRDY`** | **`D9`** | Señal *Data Ready* (avisa al Arduino cuando termina cada conversión). |
-| **7** | **`Dout`** | **`D12`** (`SPI5_CIPO` / `MISO`) | Salida de datos del ADS1256 hacia el Arduino. |
-| **8** | **`Din`** | **`D11`** (`SPI5_COPI` / `MOSI`) | Entrada de comandos del Arduino hacia el ADS1256. |
-| **9** | **`SCLK`** | **`D13`** (`SPI5_SCK`) | Reloj de comunicación SPI (`SPI1` en código de Arduino GIGA). |
-| **10** | **`PDWN`** | **`3.3V`** (Pin `3V3`) | **¡MUY IMPORTANTE!** Debe ir conectado a **3.3V**; si se deja desconectado, el ADS1256 permanece apagado. |
-
----
-
-## 7. Lista de Verificación Rápida antes de Encender (Checklist)
-
-- [ ] **1. Cabezal `2.5V / GND` del ADS1256 (abajo a la derecha junto al chip `REF03`):** Verifica que **NO tenga ningún jumper puesto** haciendo puente entre `2.5V` y `GND`. Esos dos pines deben estar abiertos (sin puente).
-- [ ] **2. Pin `PDWN` del ADS1256:** Verifica que tenga cable hacia el pin **`3.3V`** del Arduino GIGA.
-- [ ] **3. Pin `AINCOM` del ADS1256:** Verifica que al menos un pin de la **columna izquierda** del cabezal `AIN` esté conectado a **`GND`** de la Arduino.
-- [ ] **4. Cables `X4.P` de las LAC:** Verifica que entren en la **columna derecha** (`AIN0` a `AIN5`) del cabezal `AIN`.
-- [ ] **5. Potenciómetros azules de la LAC:**
-  - `Speed` (Velocidad): Girado a la derecha (sentido horario = máxima velocidad).
-  - `Retract Limit` y `Extend Limit` (abajo junto al USB): Girados completamente a la derecha (sentido horario = 100% de carrera permitida).
-  - `Accuracy`: Girado a la derecha y regresado ~1/8 de vuelta si se escucha vibración. *(Recuerda que si mueves un potenciómetro azul de la LAC, debes apagar y volver a encender los 12 V de la LAC para que tome el cambio).*
-
----
-
-## 8. Pasos en Casa para Actualizar Software y Firmware
-
-1. **Actualizar el repositorio en la PC de tu casa:**
-   Abre una terminal en la carpeta del proyecto y ejecuta:
-   ```powershell
-   git pull origin main
-   ```
-2. **Subir el nuevo Sketch al Arduino GIGA R1:**
-   * Abre en Arduino IDE el archivo del proyecto:
-     `firmware/gough_stewart_giga_ads1256/gough_stewart_giga_ads1256.ino`
-   * Compila y súbelo al **Arduino GIGA R1**.
-   * En la parte inferior de la pantalla del Arduino GIGA verás:
-     * `ADC: ADS1256 24-bit SPI1` (si el ADS1256 respondió correctamente por SPI).
-     * `ADC: INTERNO A0-A5` (si aún no conectas el ADS1256, usando `A0–A5` automáticamente como respaldo).
-3. **Probar en la Interfaz Gráfica (`python main.py`):**
-   * Haz clic en **⚙ CONFIG**, selecciona el puerto COM del Arduino GIGA a `115200` baudios y presiona **CONECTAR**.
-   * El indicador superior pasará a **CONECTADO (Verde)**, enviará automáticamente `adsinit` y mantendrá viva la conexión con `ping` cada 2.5 segundos.
-   * Ve a la pestaña **Actuadores (L1 - L6)** (ahora organizada en cuadrícula `2×3` sin barras de scroll): mueve el slider de `L1` y observa cómo la barra verde **Real** sigue al **Setpoint (SP)**.
+Cada vez que ejecutas la aplicación:
+1. **Detección e Identificación (`0x51 GET_SERIAL_NUM`):** Escanea el Hub USB buscando dispositivos `VID=0x04D8, PID=0xFC5F` y asocia cada tarjeta a `L1..L6`.
+2. **Carga de Configuración (`0x01` a `0x0F`):** Sube automáticamente a las 6 tarjetas los parámetros configurados en `config/parameters.json` (`Accuracy`, `Retract Limit`, `Extend Limit`, ganancias `Kp`/`Kd`, `PWM Max/Min`, `Stall Time`, `Movement Threshold`, `Average ADC`).
+3. **Lectura Inicial (`0x10 GET_FEEDBACK`):** Consulta la posición real actual (`0..1023`) de los 6 actuadores y actualiza las barras y gráficas de telemetría.
+4. **Control y Retroalimentación en Tiempo Real (`0x20 SET_POSITION`):** En cada ciclo de movimiento, envía el paquete de 3 bytes `[0x20, low, high]` (`0..1023`) a cada LAC y recibe en la respuesta inmediata de 3 bytes la lectura actual del ADC interno de la tarjeta.

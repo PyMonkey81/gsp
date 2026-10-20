@@ -94,5 +94,30 @@
       -9.84,
       35.7
     ]
-  ]
+  ],
+  "LAC_CONFIG": {
+    "accuracy": 4,
+    "retract_limit": 0,
+    "extend_limit": 1023,
+    "movement_threshold": 3,
+    "stall_time": 10000,
+    "pwm_threshold": 80,
+    "derivative_threshold": 10,
+    "max_derivative": 1023,
+    "min_derivative": 0,
+    "max_pwm": 1023,
+    "min_pwm": 80,
+    "kp": 1,
+    "kd": 10,
+    "average_rc": 4,
+    "average_adc": 8,
+    "invert_axis": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  }
 }

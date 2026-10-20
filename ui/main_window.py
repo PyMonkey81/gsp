@@ -110,6 +110,9 @@ class MainWindow(QMainWindow):
         # Initialize platform at HOME (all actuators retracted at 0.0 mm)
         self.go_home()
 
+        # Auto-discover and configure the 6 Actuonix LAC boards on USB Hub startup
+        QTimer.singleShot(250, self.serial_manager.auto_connect_usb_on_startup)
+
     def _setup_ui(self):
         """Construct the entire interface layout."""
         central_widget = QWidget()
@@ -209,16 +212,16 @@ class MainWindow(QMainWindow):
         # layout.addWidget(self.btn_connect)
 
         # Serial Config Dialog Button
-        self.btn_serial_config = QPushButton("⚙ CONFIG")
-        self.btn_serial_config.setFixedWidth(120)
-        self.btn_serial_config.setToolTip("Configuración de comunicación serial y simulador")
+        self.btn_serial_config = QPushButton("⚙ CONFIG USB")
+        self.btn_serial_config.setFixedWidth(125)
+        self.btn_serial_config.setToolTip("Configuración de Hub USB (6 Tarjetas Actuonix LAC) y Modo Simulador")
         self.btn_serial_config.clicked.connect(self.open_serial_config)
         layout.addWidget(self.btn_serial_config)
 
         # Read Hardware Position Button
         self.btn_read_pos = QPushButton("📍 LEER POS")
         self.btn_read_pos.setFixedWidth(130)
-        self.btn_read_pos.setToolTip("Consultar posición actual al firmware ('getpos')")
+        self.btn_read_pos.setToolTip("Consultar posición actual a las 6 tarjetas LAC por USB (0x10 GET_FEEDBACK)")
         self.btn_read_pos.clicked.connect(self.read_hardware_position)
         layout.addWidget(self.btn_read_pos)
 
@@ -492,11 +495,12 @@ class MainWindow(QMainWindow):
         row_params = QHBoxLayout()
         lbl_dur = QLabel("Duración:")
         lbl_dur.setStyleSheet("color: #90A4AE; font-size: 11px;")
+        lbl_dur.setFixedWidth(70)        
         self.spin_traj_dur = QDoubleSpinBox()
         self.spin_traj_dur.setRange(3.0, 720.0)
         self.spin_traj_dur.setValue(60.0)
         self.spin_traj_dur.setSuffix(" s")
-        self.spin_traj_dur.setFixedWidth(75)
+        self.spin_traj_dur.setFixedWidth(120)
 
         lbl_amp = QLabel("Amplitud β:")
         lbl_amp.setStyleSheet("color: #90A4AE; font-size: 11px;")
@@ -736,11 +740,8 @@ class MainWindow(QMainWindow):
             self.btn_connect.setText("DESCONECTAR")
             self.btn_connect.setStyleSheet(f"background-color: {COLOR_EMERGENCY}; border: 1px solid #FF5252;")
         self.badge_conn.set_status("CONECTADO", "green")
-        self.log_message(f"[SERIAL] Conectado a {port} a {baud} baudios.")
+        self.log_message(f"[USB-LAC] Enlace activo: {port}.")
         self.ping_timer.start()
-
-        # Enviar comando de inicialización de ADS1256 una sola vez (no bloqueante)
-        self.serial_manager.send_raw("adsinit")
 
         # Iniciar polling de 500 ms si la pestaña Actuadores está actualmente visible
         if self.tab_widget.currentIndex() == 2 and not self.is_tracking:
@@ -752,7 +753,7 @@ class MainWindow(QMainWindow):
             self.btn_connect.setText("CONECTAR")
             self.btn_connect.setStyleSheet("")
         self.badge_conn.set_status("DESCONECTADO", "red")
-        self.log_message("[SERIAL] Desconectado.")
+        self.log_message("[USB-LAC] Desconectado.")
         self.ping_timer.stop()
         self._stop_actuator_polling()
 

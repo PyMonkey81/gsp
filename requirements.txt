@@ -3,3 +3,5 @@ pyqtgraph
 PyOpenGL
 numpy
 scipy
+pyusb
+libusb-package

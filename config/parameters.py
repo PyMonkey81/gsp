@@ -105,6 +105,28 @@ AVAILABLE_BAUDRATES = [9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600
 TELEMETRY_REFRESH_HZ = 30
 SERIAL_STREAM_HZ = 30
 
+# ====================== Configuración USB Actuonix LAC (Datasheet pág. 5-10) ======================
+DEFAULT_LAC_CONFIG = {
+    "accuracy": 4,               # 0x01 SET_ACCURACY (0..1023, default 4 -> +-0.39mm en 100mm)
+    "retract_limit": 0,          # 0x02 SET_RETRACT_LIMIT (0..1023)
+    "extend_limit": 1023,        # 0x03 SET_EXTEND_LIMIT (0..1023)
+    "movement_threshold": 3,     # 0x04 SET_MOVEMENT_THRESHOLD (0..1023)
+    "stall_time": 10000,         # 0x05 SET_STALL_TIME (ms, 0..65535)
+    "pwm_threshold": 80,         # 0x06 SET_PWM_THRESHOLD (0..1023)
+    "derivative_threshold": 10,  # 0x07 SET_DERIVATIVE_THRESHOLD (0..1023)
+    "max_derivative": 1023,      # 0x08 SET_DERIVATIVE_MAXIMUM (0..1023)
+    "min_derivative": 0,         # 0x09 SET_DERIVATIVE_MINIMUM (0..1023)
+    "max_pwm": 1023,             # 0x0A SET_PWM_MAXIMUM (0..1023, velocidad máxima)
+    "min_pwm": 80,               # 0x0B SET_PWM_MINIMUM (0..1023, velocidad mínima PD)
+    "kp": 1,                     # 0x0C SET_PROPORTIONAL_GAIN (Kp)
+    "kd": 10,                    # 0x0D SET_DERIVATIVE_GAIN (Kd)
+    "average_rc": 4,             # 0x0E SET_AVERAGE_RC
+    "average_adc": 8,            # 0x0F SET_AVERAGE_ADC
+    "invert_axis": [False, False, False, False, False, False],
+}
+
+LAC_CONFIG = dict(DEFAULT_LAC_CONFIG)
+
 
 def q_to_extension(q_mm: np.ndarray, l0: float = None) -> np.ndarray:
     """
@@ -153,6 +175,12 @@ def load_parameters() -> dict:
         try:
             with open(json_path, "r", encoding="utf-8") as fh:
                 data = json.load(fh)
+                if "LAC_CONFIG" not in data:
+                    data["LAC_CONFIG"] = dict(DEFAULT_LAC_CONFIG)
+                else:
+                    merged = dict(DEFAULT_LAC_CONFIG)
+                    merged.update(data["LAC_CONFIG"])
+                    data["LAC_CONFIG"] = merged
                 return data
         except Exception:
             pass
@@ -163,5 +191,24 @@ def load_parameters() -> dict:
         "T_HOME_END": T_HOME_END, "T_TRACKING_END": T_TRACKING_END,
         "DEMO_DURATION": DEMO_DURATION, "DT": DT, "FILTER_WN": FILTER_WN,
         "TRAJ_POINTS": TRAJ_POINTS,
-        "Az": Az.tolist(), "Bz": Bz.tolist()
+        "Az": Az.tolist(), "Bz": Bz.tolist(),
+        "LAC_CONFIG": dict(DEFAULT_LAC_CONFIG),
     }
+
+
+def save_lac_config(lac_cfg: dict) -> bool:
+    """Guarda el bloque LAC_CONFIG en config/parameters.json preservando el resto de parámetros."""
+    global LAC_CONFIG
+    merged = dict(DEFAULT_LAC_CONFIG)
+    merged.update(lac_cfg or {})
+    LAC_CONFIG = merged
+
+    json_path = Path(__file__).resolve().parent / "parameters.json"
+    data = load_parameters()
+    data["LAC_CONFIG"] = merged
+    try:
+        with open(json_path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
