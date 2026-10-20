@@ -643,6 +643,7 @@ class MainWindow(QMainWindow):
         btn_bar.setSpacing(6)
 
         self.btn_calibrate = QPushButton("⚙ CALIBRAR")
+        self.btn_calibrate.setToolTip("Auto-sintonizar en lazo cerrado el control PD y filtro ADC de las tarjetas LAC")
         self.btn_calibrate.clicked.connect(self.calibrate_platform)
         btn_bar.addWidget(self.btn_calibrate)
 
@@ -706,6 +707,7 @@ class MainWindow(QMainWindow):
         self.serial_manager.message_received.connect(self.log_message)
         self.serial_manager.error_occurred.connect(self.log_error)
         self.serial_manager.safe_mode_changed.connect(self._on_safe_mode_changed)
+        self.serial_manager.lac_config_updated.connect(self._on_lac_autotune_finished)
 
         # Trajectory execution timer
         self.traj_timer.timeout.connect(self._trajectory_tick)
@@ -1631,9 +1633,17 @@ class MainWindow(QMainWindow):
         self.log_error("[EMERGENCY] !!! PARADA DE EMERGENCIA DISPARADA !!!")
 
     def calibrate_platform(self):
-        """Run automated calibration sequence."""
-        self.log_message("[CALIBRATE] Iniciando secuencia de calibración automática...")
-        self.serial_manager.calibrate()
+        """Run automated closed-loop LAC PD & ADC auto-tuning sequence."""
+        if self.is_tracking:
+            self.abort_trajectory()
+        self.badge_mode.set_status("AUTOTUNE LAC", "yellow")
+        self.log_message("[CALIBRATE] Iniciando auto-sintonización PD en lazo cerrado con el ADC de las LAC...")
+        self.serial_manager.autotune_lac(save_eeprom=False)
+
+    @Slot(dict)
+    def _on_lac_autotune_finished(self, tuned_cfg: dict):
+        """Update UI status when LAC closed-loop auto-tuning finishes."""
+        self.badge_mode.set_status("LAC SINTONIZADO", "green")
 
     def run_test_pattern(self):
         """Execute demonstration motion pattern."""

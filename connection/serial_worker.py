@@ -1,15 +1,17 @@
 """
 Asynchronous USB LAC Worker for PySide6.
 Handles direct USB communication with 6 Actuonix LAC boards via a USB Hub,
-automatic startup discovery & configuration upload, and virtual simulator fallback.
+automatic startup discovery & configuration upload, closed-loop ADC auto-tuning,
+and virtual simulator fallback.
 """
 
 import time
 import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot
 
-from config.parameters import load_parameters, DEFAULT_LAC_CONFIG
+from config.parameters import load_parameters, save_lac_config, DEFAULT_LAC_CONFIG
 from connection.lac_usb_driver import LacUsbHubController
+from connection.lac_autotuner import LacAutoTuner
 
 
 class SerialWorker(QObject):
@@ -17,6 +19,7 @@ class SerialWorker(QObject):
     message_received = Signal(str)
     telemetry_received = Signal(list)
     devices_updated = Signal(list)
+    lac_config_updated = Signal(dict)
     error = Signal(str)
     finished = Signal()
 
@@ -27,6 +30,7 @@ class SerialWorker(QObject):
         self.baudrate = 115200
         self.is_simulated = False
         self.is_usb_connected = False
+        self._is_autotuning = False
         self._target_percent = np.zeros(6, dtype=np.float64)
         self._actual_percent = np.zeros(6, dtype=np.float64)
         self._last_usb_io_time = 0.0
@@ -101,11 +105,15 @@ class SerialWorker(QObject):
         cmd = command.strip()
         cmd_lower = cmd.lower()
 
+        if cmd_lower == "calibrate":
+            self.autotune_lac(save_eeprom=False)
+            return
+
         if self.is_simulated:
             if cmd_lower == "home":
                 self._target_percent[:] = 0.0
                 self.message_received.emit("[SIM] Recibido: home (0% en 6 LACs)")
-            elif cmd_lower in ("adsinit", "calibrate"):
+            elif cmd_lower == "adsinit":
                 self.message_received.emit(f"[SIM] Configuración LAC aplicada ({cmd_lower})")
             elif cmd_lower == "estop":
                 self._target_percent = self._actual_percent.copy()
@@ -143,7 +151,7 @@ class SerialWorker(QObject):
         if cmd_lower == "ping":
             return
 
-        if cmd_lower in ("adsinit", "calibrate"):
+        if cmd_lower == "adsinit":
             lac_cfg = self._load_lac_cfg()
             _, cfg_logs = self.lac_hub.upload_configuration_all(lac_cfg, save_to_eeprom=False)
             for msg in cfg_logs:
@@ -219,8 +227,71 @@ class SerialWorker(QObject):
                 self.error.emit(f"[USB-LAC] Error en movimiento individual: {e}")
             return
 
+    def _on_autotune_telemetry(self, pcts: list):
+        self._actual_percent = np.asarray(pcts, dtype=np.float64)
+        self._last_usb_io_time = time.perf_counter()
+        self.telemetry_received.emit(self._actual_percent.tolist())
+
+    @Slot(bool)
+    def autotune_lac(self, save_eeprom: bool = False):
+        """
+        Runs the closed-loop PD & ADC filter auto-tuning routine using the LAC's internal
+        10-bit ADC feedback (0x10 GET_FEEDBACK / 0x20 SET_POSITION).
+        """
+        if self._is_autotuning:
+            self.message_received.emit("[AUTOTUNE] Ya hay una sintonización automática en curso.")
+            return
+
+        if self.is_simulated:
+            self.message_received.emit("[AUTOTUNE-SIM] Simulando auto-sintonización PD de las 6 tarjetas LAC...")
+            cfg = self._load_lac_cfg()
+            cfg.update({
+                "accuracy": 4,
+                "pwm_threshold": 75,
+                "kp": 2,
+                "kd": 12,
+                "min_pwm": 82,
+                "average_adc": 8,
+            })
+            save_lac_config(cfg)
+            self.lac_config_updated.emit(cfg)
+            self.message_received.emit(
+                "[AUTOTUNE-SIM] Sintonización simulada completada: "
+                "accuracy=4, pwm_threshold=75, Kp=2, Kd=12, min_pwm=82, average_adc=8."
+            )
+            return
+
+        if not self.is_usb_connected or self.lac_hub.connected_count == 0:
+            self.error.emit(
+                "[AUTOTUNE] No hay tarjetas Actuonix LAC conectadas por USB para sintonizar."
+            )
+            return
+
+        self._is_autotuning = True
+        try:
+            tuner = LacAutoTuner(
+                hub=self.lac_hub,
+                base_cfg=self._load_lac_cfg(),
+                log_cb=self.message_received.emit,
+                telemetry_cb=self._on_autotune_telemetry,
+            )
+            ok, tuned_cfg, _ = tuner.run_autotune(save_to_eeprom=save_eeprom)
+            self._actual_percent = self.lac_hub.read_all_feedback_percent(self._actual_percent)
+            self._target_percent = self._actual_percent.copy()
+            self._last_usb_io_time = time.perf_counter()
+            self.telemetry_received.emit(self._actual_percent.tolist())
+            self.devices_updated.emit(self.lac_hub.get_devices_summary())
+            if ok:
+                self.lac_config_updated.emit(tuned_cfg)
+        except Exception as e:
+            self.error.emit(f"[AUTOTUNE] Error durante la sintonización automática: {e}")
+        finally:
+            self._is_autotuning = False
+
     @Slot(list)
     def send_positions(self, positions: list):
+        if self._is_autotuning:
+            return
         if len(positions) != 6:
             self.error.emit("Se requieren exactamente 6 posiciones")
             return
@@ -282,6 +353,8 @@ class SerialWorker(QObject):
         )
 
     def process_incoming(self):
+        if self._is_autotuning:
+            return
         if self.is_simulated:
             alpha_filt = 0.25
             noise = np.random.normal(0.0, 0.05, size=6)

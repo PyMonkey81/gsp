@@ -21,6 +21,7 @@ class SerialManager(QObject):
     real_position_received = Signal(list)
     safe_mode_changed = Signal(bool)
     devices_updated = Signal(list)
+    lac_config_updated = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -44,6 +45,7 @@ class SerialManager(QObject):
         self.worker.message_received.connect(self._on_worker_message)
         self.worker.telemetry_received.connect(self.telemetry_received)
         self.worker.devices_updated.connect(self._on_devices_updated)
+        self.worker.lac_config_updated.connect(self.lac_config_updated)
         self.worker.error.connect(self.error_occurred)
         self.worker.finished.connect(self.thread.quit)
 
@@ -214,6 +216,18 @@ class SerialManager(QObject):
             Q_ARG(bool, bool(save_eeprom)),
         )
 
+    def autotune_lac(self, save_eeprom: bool = False):
+        """
+        Ejecuta la sintonización automática en lazo cerrado (PD + filtro ADC) de las tarjetas LAC
+        usando el ADC interno de 10 bits (0x10 GET_FEEDBACK / 0x20 SET_POSITION).
+        """
+        QMetaObject.invokeMethod(
+            self.worker,
+            "autotune_lac",
+            Qt.ConnectionType.QueuedConnection,
+            Q_ARG(bool, bool(save_eeprom)),
+        )
+
     def assign_lac_serial(self, raw_index: int, new_axis_serial: int):
         """Asigna un número de serie (1..6) con el comando 0x50 SET_SERIAL_NUM a una tarjeta LAC."""
         QMetaObject.invokeMethod(
@@ -279,7 +293,8 @@ class SerialManager(QObject):
         self.send_raw("reset_safe")
 
     def calibrate(self):
-        self.send_raw("calibrate")
+        """Ejecuta la auto-sintonización en lazo cerrado del control PD de las LAC."""
+        self.autotune_lac(save_eeprom=False)
 
     def zero_sensors(self):
         self.send_raw("zero")

@@ -5,6 +5,7 @@ Provides:
   - USB Hub discovery & connection for 6 Actuonix LAC boards (or Virtual Simulator)
   - Live per-board status and Serial ID assignment (0x50 SET_SERIAL_NUM / 0x51 GET_SERIAL_NUM)
   - Full Advanced LAC Configuration parameters (0x01..0x0F, 0x30 Disable Manual EEPROM, 0xFF Reset)
+  - Closed-loop PD Auto-Tuning using the LAC's internal 10-bit ADC feedback
 """
 
 from PySide6.QtCore import Qt, Slot
@@ -34,7 +35,7 @@ class SerialConfigDialog(QDialog):
         self.serial_manager = serial_manager
 
         self.setWindowTitle("Configuración USB Actuonix LAC (Hub 6 Puertos)")
-        self.setMinimumWidth(680)
+        self.setMinimumWidth(700)
         self.setModal(True)
 
         self.setStyleSheet(f"""
@@ -128,7 +129,7 @@ class SerialConfigDialog(QDialog):
         self.combo_ports = QComboBox()
         self.btn_refresh = QPushButton("↻ Escanear USB")
         self.btn_refresh.setToolTip("Buscar tarjetas Actuonix LAC conectadas al Hub USB (VID=0x04D8, PID=0xFC5F)")
-        self.btn_refresh.clicked.connect(self.refresh_ports)
+        self.btn_refresh.clicked.connect(self._on_scan_usb_clicked)
 
         row_port = QHBoxLayout()
         row_port.addWidget(self.combo_ports, stretch=1)
@@ -248,19 +249,28 @@ class SerialConfigDialog(QDialog):
 
         # Config action buttons
         cfg_btn_row = QHBoxLayout()
-        self.btn_upload_ram = QPushButton("⬆ Guardar y Subir a 6 LACs (RAM)")
+        self.btn_autotune = QPushButton("🎯 Auto-Sintonizar PD (ADC)")
+        self.btn_autotune.setToolTip(
+            "Mide el ADC de 10 bits en escalones cerrados y sintoniza automáticamente "
+            "Accuracy, PWM Threshold, Kp, Kd, Min PWM y Average ADC"
+        )
+        self.btn_autotune.setStyleSheet(f"color: {COLOR_CYAN}; font-weight: 700;")
+        self.btn_autotune.clicked.connect(self._on_autotune_clicked)
+        cfg_btn_row.addWidget(self.btn_autotune)
+
+        self.btn_upload_ram = QPushButton("⬆ Guardar y Subir (RAM)")
         self.btn_upload_ram.setToolTip("Guarda estos parámetros y los envía a las 6 tarjetas LAC conectadas")
         self.btn_upload_ram.clicked.connect(lambda: self._apply_lac_config(save_eeprom=False))
         cfg_btn_row.addWidget(self.btn_upload_ram)
 
-        self.btn_disable_manual = QPushButton("💾 Disable Defaults / Guardar EEPROM (0x30)")
+        self.btn_disable_manual = QPushButton("💾 Guardar EEPROM (0x30)")
         self.btn_disable_manual.setToolTip(
             "Envía 0x30 DISABLE_MANUAL: desactiva los 4 potenciómetros físicos y guarda en EEPROM de las LACs"
         )
         self.btn_disable_manual.clicked.connect(lambda: self._apply_lac_config(save_eeprom=True))
         cfg_btn_row.addWidget(self.btn_disable_manual)
 
-        self.btn_reset_factory = QPushButton("↺ Re-enable Defaults (0xFF)")
+        self.btn_reset_factory = QPushButton("↺ Reset Fábrica (0xFF)")
         self.btn_reset_factory.setToolTip("Envía 0xFF RESET: reactiva potenciómetros físicos y valores de fábrica")
         self.btn_reset_factory.clicked.connect(self._on_reset_factory_clicked)
         cfg_btn_row.addWidget(self.btn_reset_factory)
@@ -283,11 +293,15 @@ class SerialConfigDialog(QDialog):
 
         layout.addLayout(btn_layout)
 
-    def _load_current_lac_values(self):
-        params = load_parameters()
-        cfg = dict(DEFAULT_LAC_CONFIG)
-        if isinstance(params, dict) and "LAC_CONFIG" in params:
-            cfg.update(params["LAC_CONFIG"])
+    def _load_current_lac_values(self, cfg_override: dict = None):
+        if cfg_override is not None:
+            cfg = dict(DEFAULT_LAC_CONFIG)
+            cfg.update(cfg_override)
+        else:
+            params = load_parameters()
+            cfg = dict(DEFAULT_LAC_CONFIG)
+            if isinstance(params, dict) and "LAC_CONFIG" in params:
+                cfg.update(params["LAC_CONFIG"])
 
         for key, sp in self.spins_lac.items():
             if key in cfg:
@@ -316,6 +330,45 @@ class SerialConfigDialog(QDialog):
             "Configuración LAC Aplicada",
             f"La configuración de las tarjetas Actuonix LAC fue {mode_msg}.",
         )
+
+    def _on_autotune_clicked(self):
+        if not self.serial_manager.is_connected:
+            QMessageBox.warning(
+                self,
+                "Enlace desconectado",
+                "Conecte primero el Hub USB con las tarjetas LAC antes de iniciar la auto-sintonización.",
+            )
+            return
+        reply = QMessageBox.question(
+            self,
+            "Confirmar Auto-Sintonización PD (ADC 10-bit)",
+            "Se ejecutará una rutina automática de escalones cortos (18% ↔ 38%)\n"
+            "leyendo el ADC interno (0x10 GET_FEEDBACK) de las tarjetas LAC conectadas\n"
+            "para sintonizar Accuracy, PWM Threshold, Kp, Kd, Min PWM y Average ADC.\n\n"
+            "¿Desea iniciar la sintonización ahora?",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if reply == QMessageBox.Yes:
+            self.btn_autotune.setEnabled(False)
+            self.btn_autotune.setText("⏳ Sintonizando...")
+            self.serial_manager.autotune_lac(save_eeprom=False)
+
+    @Slot(dict)
+    def _on_lac_config_updated(self, tuned_cfg: dict):
+        self._load_current_lac_values(cfg_override=tuned_cfg)
+        self.btn_autotune.setEnabled(True)
+        self.btn_autotune.setText("🎯 Auto-Sintonizar PD (ADC)")
+        if self.isVisible():
+            QMessageBox.information(
+                self,
+                "Auto-Sintonización Completada",
+                "Parámetros PD óptimos calculados desde el ADC de las LAC y guardados en parameters.json:\n\n"
+                f"• Accuracy (0x01): {tuned_cfg.get('accuracy')} ADC\n"
+                f"• PWM Threshold (0x06): {tuned_cfg.get('pwm_threshold')} ADC\n"
+                f"• Kp (0x0C): {tuned_cfg.get('kp')} | Kd (0x0D): {tuned_cfg.get('kd')}\n"
+                f"• PWM Minimum (0x0B): {tuned_cfg.get('min_pwm')}\n"
+                f"• Average ADC (0x0F): {tuned_cfg.get('average_adc')}",
+            )
 
     def _on_assign_serial_clicked(self):
         if self.combo_raw_dev.count() == 0:
@@ -346,12 +399,19 @@ class SerialConfigDialog(QDialog):
         self.serial_manager.connected.connect(self._on_connected)
         self.serial_manager.disconnected.connect(self._on_disconnected)
         self.serial_manager.devices_updated.connect(self._update_devices_list)
+        self.serial_manager.lac_config_updated.connect(self._on_lac_config_updated)
 
     @Slot(list)
     def _update_devices_list(self, devices: list):
         self.combo_raw_dev.clear()
         if not devices:
-            self.lbl_detected_summary.setText("Tarjetas LAC activas en Hub USB: 0/6")
+            n_bus = self.serial_manager.count_physical_lac_boards()
+            if n_bus > 0 and not self.serial_manager.is_connected:
+                self.lbl_detected_summary.setText(
+                    f"Tarjetas LAC detectadas en bus USB: {n_bus}/6 (Presione 'CONECTAR' para abrirlas)"
+                )
+            else:
+                self.lbl_detected_summary.setText("Tarjetas LAC activas en Hub USB: 0/6")
             return
 
         parts = []
@@ -365,6 +425,14 @@ class SerialConfigDialog(QDialog):
             f"Tarjetas LAC activas ({len(devices)}/6): " + ", ".join(parts)
         )
 
+    def _on_scan_usb_clicked(self):
+        self.refresh_ports()
+        if not self.serial_manager.is_connected and not self.chk_simulation.isChecked():
+            n_lac = self.serial_manager.count_physical_lac_boards()
+            if n_lac > 0:
+                save_lac_config(self._collect_lac_cfg())
+                self.serial_manager.connect_port(self.combo_ports.currentText(), 115200)
+
     def refresh_ports(self):
         current = self.combo_ports.currentText()
         self.combo_ports.clear()
@@ -374,6 +442,7 @@ class SerialConfigDialog(QDialog):
             self.combo_ports.setCurrentText(current)
         elif self.serial_manager.current_port in ports:
             self.combo_ports.setCurrentText(self.serial_manager.current_port)
+        self._update_devices_list(self.serial_manager.detected_devices)
 
     def _on_simulation_toggled(self, checked: bool):
         if checked:
