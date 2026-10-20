@@ -21,8 +21,8 @@ COLOR_TEXT_PRIMARY = "#ECEFF1"
 COLOR_TEXT_SECONDARY = "#90A4AE"
 COLOR_TEXT_MUTED = "#546E7A"
 
-FONT_MAIN = "'Segoe UI', 'Roboto', 'Inter', -apple-system, sans-serif"
-FONT_MONO = "'Consolas', 'Cascadia Code', 'Fira Code', 'Courier New', monospace"
+FONT_MAIN = "'Segoe UI', 'Ubuntu', 'Roboto', 'Inter', 'DejaVu Sans', -apple-system, sans-serif"
+FONT_MONO = "'Consolas', 'Ubuntu Mono', 'Cascadia Code', 'Fira Code', 'DejaVu Sans Mono', 'Courier New', monospace"
 
 INDUSTRIAL_DARK_STYLESHEET = f"""
 /* =========================================================================

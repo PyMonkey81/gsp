@@ -21,13 +21,19 @@ def main():
         print(" ", line)
 
     if count == 0:
-        print("\n[!] No se detectó ninguna tarjeta LAC abierta por PyUSB/mpusbapi.")
+        import sys
+        print("\n[!] No se detectó ninguna tarjeta LAC abierta por USB.")
         print("    Posibles causas:")
         print("    1. Verifica que el cable Mini-USB sea de DATOS (no solo de carga).")
-        print("    2. Si en el Administrador de Dispositivos aparece como 'Custom USB Device'")
-        print("       (Microchip mchpusb.sys) y PyUSB no puede abrirla en 64 bits:")
-        print("       -> Abre Zadig (https://zadig.akeo.ie/), selecciona la LAC (04D8:FC5F)")
-        print("          y cambia el driver a 'WinUSB'.")
+        if sys.platform.startswith("linux"):
+            print("    2. En Ubuntu/Linux, si falta el permiso udev (Errno 13), ejecuta una sola vez:")
+            print("       -> bash setup_ubuntu.sh")
+            print("       y desconecta/reconecta el cable USB.")
+        else:
+            print("    2. En Windows, si en el Administrador de Dispositivos aparece como 'Custom USB Device'")
+            print("       (Microchip mchpusb.sys) y PyUSB no puede abrirla en 64 bits:")
+            print("       -> Abre Zadig (https://zadig.akeo.ie/), selecciona la LAC (04D8:FC5F)")
+            print("          y cambia el driver a 'WinUSB'.")
         return
 
     print(f"\n[OK] Se detectaron {count} tarjeta(s) LAC conectada(s):")

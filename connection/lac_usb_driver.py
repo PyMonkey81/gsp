@@ -52,7 +52,22 @@ CMD_RESET = 0xFF
 
 
 def _get_usb_backend():
-    """Returns the pyusb backend using libusb_package if available on Windows."""
+    """
+    Returns the pyusb libusb1 backend for both Windows and Ubuntu/Linux.
+    - On Linux (Ubuntu): prioritizes system libusb-1.0.so.0, then libusb_package.
+    - On Windows: prioritizes bundled libusb_package (64-bit/32-bit DLL), then system libusb1.
+    """
+    import sys
+
+    if sys.platform.startswith("linux"):
+        try:
+            import usb.backend.libusb1 as libusb1
+            backend = libusb1.get_backend()
+            if backend is not None:
+                return backend
+        except Exception:
+            pass
+
     try:
         import libusb_package
         backend = libusb_package.get_libusb1_backend()
@@ -60,6 +75,7 @@ def _get_usb_backend():
             return backend
     except Exception:
         pass
+
     try:
         import usb.backend.libusb1 as libusb1
         return libusb1.get_backend()
@@ -291,7 +307,14 @@ class LacUsbHubController:
                     lac_dev.get_feedback_raw()
                     self.raw_devices.append(lac_dev)
                 except Exception as e:
-                    logs.append(f"[USB-LAC] Advertencia al abrir dispositivo #{idx}: {e}")
+                    err_str = str(e)
+                    if "Errno 13" in err_str or "Access denied" in err_str:
+                        logs.append(
+                            f"[USB-LAC] Permiso USB denegado en dispositivo #{idx} ({e}). "
+                            "En Ubuntu ejecute: sudo bash setup_ubuntu.sh (o instale 99-actuonix-lac.rules)."
+                        )
+                    else:
+                        logs.append(f"[USB-LAC] Advertencia al abrir dispositivo #{idx}: {e}")
         except Exception as e:
             logs.append(f"[USB-LAC] Aviso backend PyUSB: {e}")
 
