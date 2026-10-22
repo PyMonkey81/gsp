@@ -6,6 +6,7 @@ and virtual simulator fallback.
 """
 
 import time
+from typing import List, Optional
 import numpy as np
 from PySide6.QtCore import QObject, Signal, Slot
 
@@ -20,20 +21,26 @@ class SerialWorker(QObject):
     telemetry_received = Signal(list)
     devices_updated = Signal(list)
     lac_config_updated = Signal(dict)
+    incoming_processed = Signal()
     error = Signal(str)
     finished = Signal()
 
     def __init__(self):
         super().__init__()
-        self.lac_hub = LacUsbHubController()
+        self.lac_hub = LacUsbHubController(log_callback=self._on_lac_hub_log)
         self.port_name = ""
         self.baudrate = 115200
         self.is_simulated = False
         self.is_usb_connected = False
         self._is_autotuning = False
+        self._usb_busy = False
+        self._pending_target_percent: Optional[List[float]] = None
         self._target_percent = np.zeros(6, dtype=np.float64)
         self._actual_percent = np.zeros(6, dtype=np.float64)
         self._last_usb_io_time = 0.0
+
+    def _on_lac_hub_log(self, msg: str):
+        self.message_received.emit(msg)
 
     def _load_lac_cfg(self) -> dict:
         params = load_parameters()
@@ -49,6 +56,8 @@ class SerialWorker(QObject):
 
         self.lac_hub.close_all()
         self.is_usb_connected = False
+        self._pending_target_percent = None
+        self._usb_busy = False
 
         # 1. Handle Virtual Simulator Mode
         if "SIMULADOR" in port_name.upper() or "MOCK" in port_name.upper():
@@ -93,6 +102,8 @@ class SerialWorker(QObject):
 
     @Slot()
     def disconnect_port(self):
+        self._pending_target_percent = None
+        self._usb_busy = False
         self.lac_hub.close_all()
         self.is_usb_connected = False
         self.is_simulated = False
@@ -152,38 +163,42 @@ class SerialWorker(QObject):
             return
 
         if cmd_lower == "adsinit":
-            lac_cfg = self._load_lac_cfg()
-            _, cfg_logs = self.lac_hub.upload_configuration_all(lac_cfg, save_to_eeprom=False)
-            for msg in cfg_logs:
-                self.message_received.emit(msg)
-            self.devices_updated.emit(self.lac_hub.get_devices_summary())
+            self._usb_busy = True
+            try:
+                lac_cfg = self._load_lac_cfg()
+                _, cfg_logs = self.lac_hub.upload_configuration_all(lac_cfg, save_to_eeprom=False)
+                for msg in cfg_logs:
+                    self.message_received.emit(msg)
+                self.devices_updated.emit(self.lac_hub.get_devices_summary())
+            finally:
+                self._usb_busy = False
+                self._process_pending_target()
             return
 
         if cmd_lower == "home":
-            self._target_percent[:] = 0.0
-            self._actual_percent = self.lac_hub.set_all_positions_percent(
-                self._target_percent.tolist(), self._actual_percent
-            )
-            self._last_usb_io_time = time.perf_counter()
-            self.telemetry_received.emit(self._actual_percent.tolist())
+            self.send_positions([0.0] * 6)
             self.message_received.emit("[USB-LAC] Comando HOME (0x20 SET_POSITION = 0) enviado a las 6 LACs.")
             return
 
         if cmd_lower == "estop":
-            # Read actual positions and freeze each actuator at its current position
-            self._actual_percent = self.lac_hub.read_all_feedback_percent(self._actual_percent)
-            self._target_percent = self._actual_percent.copy()
-            self._actual_percent = self.lac_hub.set_all_positions_percent(
-                self._target_percent.tolist(), self._actual_percent
-            )
-            self._last_usb_io_time = time.perf_counter()
-            self.telemetry_received.emit(self._actual_percent.tolist())
+            target = self._actual_percent.tolist()
+            self._pending_target_percent = None
+            if self._usb_busy or self.lac_hub.is_busy:
+                self._pending_target_percent = target
+                return
+            self._execute_set_positions(target)
             self.message_received.emit("[USB-LAC] ESTOP ejecutado: 6 actuadores detenidos en su posición actual.")
             return
 
         if cmd_lower == "getpos":
-            self._actual_percent = self.lac_hub.read_all_feedback_percent(self._actual_percent)
-            self._last_usb_io_time = time.perf_counter()
+            if not (self._usb_busy or self.lac_hub.is_busy):
+                self._usb_busy = True
+                try:
+                    self._actual_percent = self.lac_hub.read_all_feedback_percent(self._actual_percent)
+                    self._last_usb_io_time = time.perf_counter()
+                finally:
+                    self._usb_busy = False
+                    self._process_pending_target()
             self.devices_updated.emit(self.lac_hub.get_devices_summary())
             vals = [round(float(p), 2) for p in self._actual_percent]
             pos_str = "pos " + ",".join(str(v) for v in vals)
@@ -194,15 +209,8 @@ class SerialWorker(QObject):
             try:
                 parts = cmd[4:].split(",")
                 if len(parts) == 6:
-                    self._target_percent = np.clip(
-                        np.array([float(p) for p in parts], dtype=np.float64), 0.0, 100.0
-                    )
-                    # 0x20 SET_POSITION writes target and simultaneously returns ADC feedback
-                    self._actual_percent = self.lac_hub.set_all_positions_percent(
-                        self._target_percent.tolist(), self._actual_percent
-                    )
-                    self._last_usb_io_time = time.perf_counter()
-                    self.telemetry_received.emit(self._actual_percent.tolist())
+                    target_vals = [float(p) for p in parts]
+                    self.send_positions(target_vals)
             except Exception as e:
                 self.error.emit(f"[USB-LAC] Error enviando posiciones: {e}")
             return
@@ -214,11 +222,19 @@ class SerialWorker(QObject):
                 val = float(np.clip(float(parts[1]), 0.0, 100.0))
                 if 1 <= axis_1based <= 6:
                     self._target_percent[axis_1based - 1] = val
-                    fb = self.lac_hub.set_single_position_percent(axis_1based, val)
-                    if fb is not None:
-                        self._actual_percent[axis_1based - 1] = fb
-                    self._last_usb_io_time = time.perf_counter()
-                    self.telemetry_received.emit(self._actual_percent.tolist())
+                    if self._usb_busy or self.lac_hub.is_busy:
+                        self._pending_target_percent = self._target_percent.tolist()
+                        return
+                    self._usb_busy = True
+                    try:
+                        fb = self.lac_hub.set_single_position_percent(axis_1based, val)
+                        if fb is not None:
+                            self._actual_percent[axis_1based - 1] = fb
+                        self._last_usb_io_time = time.perf_counter()
+                        self.telemetry_received.emit(self._actual_percent.tolist())
+                    finally:
+                        self._usb_busy = False
+                        self._process_pending_target()
                     raw_val = self.lac_hub.percent_to_raw(axis_1based - 1, val)
                     self.message_received.emit(
                         f"[USB-LAC] Actuador L{axis_1based} -> {val:.1f}% (0x20 SET_POSITION={raw_val}/1023)"
@@ -268,6 +284,7 @@ class SerialWorker(QObject):
             return
 
         self._is_autotuning = True
+        self._usb_busy = True
         try:
             tuner = LacAutoTuner(
                 hub=self.lac_hub,
@@ -286,7 +303,9 @@ class SerialWorker(QObject):
         except Exception as e:
             self.error.emit(f"[AUTOTUNE] Error durante la sintonización automática: {e}")
         finally:
+            self._usb_busy = False
             self._is_autotuning = False
+            self._process_pending_target()
 
     @Slot(list)
     def send_positions(self, positions: list):
@@ -296,17 +315,46 @@ class SerialWorker(QObject):
             self.error.emit("Se requieren exactamente 6 posiciones")
             return
 
-        self._target_percent = np.clip(np.asarray(positions, dtype=np.float64), 0.0, 100.0)
+        target = np.clip(np.asarray(positions, dtype=np.float64), 0.0, 100.0)
 
         if self.is_simulated:
+            self._target_percent = target
             return
 
-        if self.is_usb_connected:
+        if not self.is_usb_connected:
+            return
+
+        # Si hay una transferencia en curso, guarda solo el último setpoint (no una cola)
+        if self._usb_busy or self.lac_hub.is_busy:
+            self._pending_target_percent = target.tolist()
+            return
+
+        self._execute_set_positions(target.tolist())
+
+    def _execute_set_positions(self, target_list: List[float]):
+        if not self.is_usb_connected:
+            return
+        self._target_percent = np.asarray(target_list, dtype=np.float64)
+        self._usb_busy = True
+        try:
             self._actual_percent = self.lac_hub.set_all_positions_percent(
                 self._target_percent.tolist(), self._actual_percent
             )
             self._last_usb_io_time = time.perf_counter()
             self.telemetry_received.emit(self._actual_percent.tolist())
+        finally:
+            self._usb_busy = False
+            self._process_pending_target()
+
+    def _process_pending_target(self):
+        """
+        Si llegó un setpoint nuevo mientras había una lectura o transferencia en curso,
+        lo despacha al salir del lock asegurando que no se pierda el comando.
+        """
+        if self._pending_target_percent is not None and not self._usb_busy and self.is_usb_connected:
+            pending = self._pending_target_percent
+            self._pending_target_percent = None
+            self._execute_set_positions(pending)
 
     @Slot(dict, bool)
     def apply_lac_configuration(self, cfg: dict, save_eeprom: bool = False):
@@ -322,59 +370,85 @@ class SerialWorker(QObject):
             )
             return
 
-        _, logs = self.lac_hub.upload_configuration_all(cfg, save_to_eeprom=save_eeprom)
-        for msg in logs:
-            self.message_received.emit(msg)
-        self.devices_updated.emit(self.lac_hub.get_devices_summary())
+        self._usb_busy = True
+        try:
+            _, logs = self.lac_hub.upload_configuration_all(cfg, save_to_eeprom=save_eeprom)
+            for msg in logs:
+                self.message_received.emit(msg)
+            self.devices_updated.emit(self.lac_hub.get_devices_summary())
+        finally:
+            self._usb_busy = False
+            self._process_pending_target()
 
     @Slot(int, int)
     def assign_lac_serial(self, raw_index: int, new_axis_serial: int):
         if not self.is_usb_connected:
             self.error.emit("[USB-LAC] Conecte primero las tarjetas LAC por USB para asignarles ID.")
             return
-        ok, msg = self.lac_hub.assign_device_serial(raw_index, new_axis_serial)
-        if ok:
-            self.message_received.emit(f"[USB-LAC] {msg}")
-        else:
-            self.error.emit(f"[USB-LAC] {msg}")
-        self.devices_updated.emit(self.lac_hub.get_devices_summary())
+        self._usb_busy = True
+        try:
+            ok, msg = self.lac_hub.assign_device_serial(raw_index, new_axis_serial)
+            if ok:
+                self.message_received.emit(f"[USB-LAC] {msg}")
+            else:
+                self.error.emit(f"[USB-LAC] {msg}")
+            self.devices_updated.emit(self.lac_hub.get_devices_summary())
+        finally:
+            self._usb_busy = False
+            self._process_pending_target()
 
     @Slot()
     def reset_lac_factory(self):
         if not self.is_usb_connected:
             self.error.emit("[USB-LAC] No hay tarjetas LAC conectadas por USB.")
             return
-        count = 0
-        for dev in self.lac_hub.raw_devices:
-            if dev.reset_factory_defaults():
-                count += 1
-        self.message_received.emit(
-            f"[USB-LAC] Comando 0xFF RESET (valores de fábrica y potenciómetros activos) enviado a {count} tarjetas."
-        )
-
-    def process_incoming(self):
-        if self._is_autotuning:
-            return
-        if self.is_simulated:
-            alpha_filt = 0.25
-            noise = np.random.normal(0.0, 0.05, size=6)
-            self._actual_percent = np.clip(
-                self._actual_percent + alpha_filt * (self._target_percent - self._actual_percent) + noise,
-                0.0,
-                100.0,
+        self._usb_busy = True
+        try:
+            count = self.lac_hub.reset_factory_defaults_all()
+            self.message_received.emit(
+                f"[USB-LAC] Comando 0xFF RESET (valores de fábrica y potenciómetros activos) enviado a {count} tarjetas."
             )
-            self.telemetry_received.emit(self._actual_percent.tolist())
-            return
+        finally:
+            self._usb_busy = False
+            self._process_pending_target()
 
-        if not self.is_usb_connected:
-            return
+    @Slot()
+    def process_incoming(self):
+        try:
+            # 1. Regresa de inmediato si hay autotuning o si hay un 0x20 o 0x10 en curso (el timer no se acumula)
+            if self._is_autotuning or self._usb_busy or self.lac_hub.is_busy:
+                return
+            if self.is_simulated:
+                alpha_filt = 0.25
+                noise = np.random.normal(0.0, 0.05, size=6)
+                self._actual_percent = np.clip(
+                    self._actual_percent + alpha_filt * (self._target_percent - self._actual_percent) + noise,
+                    0.0,
+                    100.0,
+                )
+                self.telemetry_received.emit(self._actual_percent.tolist())
+                return
 
-        # Poll 0x10 GET_FEEDBACK if no 0x20 SET_POSITION occurred in the last 80 ms
-        now = time.perf_counter()
-        if now - self._last_usb_io_time >= 0.080:
-            self._actual_percent = self.lac_hub.read_all_feedback_percent(self._actual_percent)
-            self._last_usb_io_time = now
-            self.telemetry_received.emit(self._actual_percent.tolist())
+            if not self.is_usb_connected:
+                return
+
+            # 2. No manda 0x10 hasta que hayan pasado al menos 80 ms sin un 0x20
+            now = time.perf_counter()
+            last_io = max(self._last_usb_io_time, self.lac_hub.last_usb_io_time)
+            if now - last_io < 0.080:
+                return
+
+            # 3. Lectura 0x10 protegida con _usb_busy
+            self._usb_busy = True
+            try:
+                self._actual_percent = self.lac_hub.read_all_feedback_percent(self._actual_percent)
+                self._last_usb_io_time = time.perf_counter()
+                self.telemetry_received.emit(self._actual_percent.tolist())
+            finally:
+                self._usb_busy = False
+                self._process_pending_target()
+        finally:
+            self.incoming_processed.emit()
 
     @Slot()
     def stop(self):

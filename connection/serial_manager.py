@@ -30,9 +30,10 @@ class SerialManager(QObject):
         self.worker = SerialWorker()
         self.worker.moveToThread(self.thread)
 
+        self._incoming_pending = False
         self.read_timer = QTimer(self)
         self.read_timer.setInterval(33)  # ~30 Hz feedback loop
-        self.read_timer.timeout.connect(self.worker.process_incoming)
+        self.read_timer.timeout.connect(self._on_read_timer_tick)
 
         # Timer de timeout para consulta de posición 'getpos'
         self._waiting_getpos = False
@@ -46,6 +47,7 @@ class SerialManager(QObject):
         self.worker.telemetry_received.connect(self.telemetry_received)
         self.worker.devices_updated.connect(self._on_devices_updated)
         self.worker.lac_config_updated.connect(self.lac_config_updated)
+        self.worker.incoming_processed.connect(self._on_incoming_processed)
         self.worker.error.connect(self.error_occurred)
         self.worker.finished.connect(self.thread.quit)
 
@@ -87,8 +89,23 @@ class SerialManager(QObject):
 
         self.message_received.emit(message)
 
+    @Slot()
+    def _on_read_timer_tick(self):
+        # El timer no se acumula: si ya hay una llamada pendiente o en curso, no encoles otra
+        if self._incoming_pending:
+            return
+        if not self._is_connected:
+            return
+        self._incoming_pending = True
+        QMetaObject.invokeMethod(self.worker, "process_incoming", Qt.ConnectionType.QueuedConnection)
+
+    @Slot()
+    def _on_incoming_processed(self):
+        self._incoming_pending = False
+
     def _on_worker_connected(self, state: bool):
         self._is_connected = state
+        self._incoming_pending = False
         self.connected_changed.emit(state)
         if state:
             if not self.read_timer.isActive():
@@ -97,6 +114,7 @@ class SerialManager(QObject):
             self.safe_mode_changed.emit(True)
         else:
             self.read_timer.stop()
+            self._incoming_pending = False
             self._current_port = None
             self.disconnected.emit()
             self.safe_mode_changed.emit(True)
@@ -194,8 +212,12 @@ class SerialManager(QObject):
             self.error_occurred.emit("Se requieren exactamente 6 posiciones")
             return
 
-        cmd = "pos " + ",".join(f"{float(p):.3f}" for p in positions)
-        self.send_raw(cmd)
+        QMetaObject.invokeMethod(
+            self.worker,
+            "send_positions",
+            Qt.ConnectionType.QueuedConnection,
+            Q_ARG(list, list(positions)),
+        )
 
     def send_raw(self, command: str):
         """Envía comando al Worker USB LAC."""
@@ -305,6 +327,7 @@ class SerialManager(QObject):
 
     def close(self):
         self.read_timer.stop()
+        self._incoming_pending = False
         if self.thread.isRunning():
             QMetaObject.invokeMethod(self.worker, "stop", Qt.ConnectionType.QueuedConnection)
             self.thread.quit()
