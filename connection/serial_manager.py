@@ -32,7 +32,7 @@ class SerialManager(QObject):
 
         self._incoming_pending = False
         self.read_timer = QTimer(self)
-        self.read_timer.setInterval(33)  # ~30 Hz feedback loop
+        self.read_timer.setInterval(50)  # 20 Hz feedback loop (50 ms)
         self.read_timer.timeout.connect(self._on_read_timer_tick)
 
         # Timer de timeout para consulta de posición 'getpos'

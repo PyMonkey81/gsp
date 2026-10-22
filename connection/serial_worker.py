@@ -8,7 +8,7 @@ and virtual simulator fallback.
 import time
 from typing import List, Optional
 import numpy as np
-from PySide6.QtCore import QObject, Signal, Slot
+from PySide6.QtCore import QObject, Signal, Slot, QTimer
 
 from config.parameters import load_parameters, save_lac_config, DEFAULT_LAC_CONFIG
 from connection.lac_usb_driver import LacUsbHubController
@@ -38,6 +38,12 @@ class SerialWorker(QObject):
         self._target_percent = np.zeros(6, dtype=np.float64)
         self._actual_percent = np.zeros(6, dtype=np.float64)
         self._last_usb_io_time = 0.0
+        self._last_0x20_time = 0.0
+        self._last_0x10_time = 0.0
+
+        self._pending_timer = QTimer(self)
+        self._pending_timer.setSingleShot(True)
+        self._pending_timer.timeout.connect(self._process_pending_target)
 
     def _on_lac_hub_log(self, msg: str):
         self.message_received.emit(msg)
@@ -56,8 +62,11 @@ class SerialWorker(QObject):
 
         self.lac_hub.close_all()
         self.is_usb_connected = False
+        self._pending_timer.stop()
         self._pending_target_percent = None
         self._usb_busy = False
+        self._last_0x20_time = 0.0
+        self._last_0x10_time = 0.0
 
         # 1. Handle Virtual Simulator Mode
         if "SIMULADOR" in port_name.upper() or "MOCK" in port_name.upper():
@@ -102,6 +111,7 @@ class SerialWorker(QObject):
 
     @Slot()
     def disconnect_port(self):
+        self._pending_timer.stop()
         self._pending_target_percent = None
         self._usb_busy = False
         self.lac_hub.close_all()
@@ -324,9 +334,13 @@ class SerialWorker(QObject):
         if not self.is_usb_connected:
             return
 
-        # Si hay una transferencia en curso, guarda solo el último setpoint (no una cola)
-        if self._usb_busy or self.lac_hub.is_busy:
+        now = time.perf_counter()
+        # Si hay una transferencia en curso o si el último barrido 0x20 fue hace menos de 50 ms,
+        # guarda solo el último setpoint en _pending_target_percent y regresa. No encoles una ráfaga.
+        if self._usb_busy or self.lac_hub.is_busy or (now - self._last_0x20_time < 0.050):
             self._pending_target_percent = target.tolist()
+            remaining_ms = int(max(1.0, (0.050 - (now - self._last_0x20_time)) * 1000.0) + 0.5)
+            self._pending_timer.start(remaining_ms)
             return
 
         self._execute_set_positions(target.tolist())
@@ -334,27 +348,40 @@ class SerialWorker(QObject):
     def _execute_set_positions(self, target_list: List[float]):
         if not self.is_usb_connected:
             return
+        self._pending_timer.stop()
         self._target_percent = np.asarray(target_list, dtype=np.float64)
         self._usb_busy = True
         try:
             self._actual_percent = self.lac_hub.set_all_positions_percent(
                 self._target_percent.tolist(), self._actual_percent
             )
-            self._last_usb_io_time = time.perf_counter()
+            now = time.perf_counter()
+            self._last_0x20_time = now
+            self._last_usb_io_time = now
             self.telemetry_received.emit(self._actual_percent.tolist())
         finally:
             self._usb_busy = False
             self._process_pending_target()
 
+    @Slot()
     def _process_pending_target(self):
         """
-        Si llegó un setpoint nuevo mientras había una lectura o transferencia en curso,
-        lo despacha al salir del lock asegurando que no se pierda el comando.
+        _process_pending_target manda ese setpoint cuando ya pasaron 50 ms y no hay USB en curso.
         """
-        if self._pending_target_percent is not None and not self._usb_busy and self.is_usb_connected:
+        if self._pending_target_percent is None or not self.is_usb_connected:
+            return
+        if self._usb_busy or self.lac_hub.is_busy:
+            return
+        now = time.perf_counter()
+        elapsed = now - self._last_0x20_time
+        if elapsed >= 0.050:
+            self._pending_timer.stop()
             pending = self._pending_target_percent
             self._pending_target_percent = None
             self._execute_set_positions(pending)
+        else:
+            remaining_ms = int(max(1.0, (0.050 - elapsed) * 1000.0) + 0.5)
+            self._pending_timer.start(remaining_ms)
 
     @Slot(dict, bool)
     def apply_lac_configuration(self, cfg: dict, save_eeprom: bool = False):
@@ -432,17 +459,29 @@ class SerialWorker(QObject):
             if not self.is_usb_connected:
                 return
 
-            # 2. No manda 0x10 hasta que hayan pasado al menos 80 ms sin un 0x20
+            # Si hay un setpoint pendiente, intenta procesarlo
+            if self._pending_target_percent is not None:
+                self._process_pending_target()
+                if self._usb_busy or self.lac_hub.is_busy:
+                    return
+
             now = time.perf_counter()
-            last_io = max(self._last_usb_io_time, self.lac_hub.last_usb_io_time)
-            if now - last_io < 0.080:
+
+            # 2. Si hubo un 0x20 en los últimos 200 ms, no mandes 0x10. La posición de la interfaz es el eco del 0x20.
+            if now - self._last_0x20_time < 0.200:
                 return
 
-            # 3. Lectura 0x10 protegida con _usb_busy
+            # 3. Si no hubo 0x20 en los últimos 200 ms, un solo barrido 0x10 de las seis, sin pausa entre ellas, como máximo cada 50 ms.
+            if now - self._last_0x10_time < 0.050:
+                return
+
+            # Lectura 0x10 protegida con _usb_busy
             self._usb_busy = True
             try:
                 self._actual_percent = self.lac_hub.read_all_feedback_percent(self._actual_percent)
-                self._last_usb_io_time = time.perf_counter()
+                now_after = time.perf_counter()
+                self._last_0x10_time = now_after
+                self._last_usb_io_time = now_after
                 self.telemetry_received.emit(self._actual_percent.tolist())
             finally:
                 self._usb_busy = False

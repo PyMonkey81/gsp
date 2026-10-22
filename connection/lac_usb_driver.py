@@ -184,9 +184,10 @@ class LacUsbDevice:
         if not self.is_open:
             return None
 
+        control_sent = control & 0xFF
         data_clamped = int(data) & 0xFFFF
         buf_out = bytes([
-            control & 0xFF,
+            control_sent,
             data_clamped & 0xFF,
             (data_clamped >> 8) & 0xFF,
         ])
@@ -197,9 +198,26 @@ class LacUsbDevice:
                 resp = self.dev.read(EP_IN, 3, timeout=timeout_ms)
                 if resp is not None and len(resp) == 3:
                     r_ctrl = int(resp[0])
+                    # Si el primer byte del eco es 0x10 y el comando enviado fue 0x20, o al revés,
+                    # descarta el paquete y regresa None. No lo uses como posición.
+                    if (r_ctrl == 0x10 and control_sent == 0x20) or (r_ctrl == 0x20 and control_sent == 0x10):
+                        return None
                     r_val = int(resp[1]) | (int(resp[2]) << 8)
                     return r_ctrl, r_val
+                else:
+                    # No llegaron los 3 bytes: vacía el IN con una sola lectura corta y traga la excepción
+                    try:
+                        self.dev.read(EP_IN, 64, timeout=5)
+                    except Exception:
+                        pass
+                    return None
             except Exception:
+                # Si write o read vencen o lanzan excepción: vacía el IN de esa tarjeta con una sola lectura corta
+                # (EP_IN, 64 bytes, timeout 5 ms) y traga la excepción. Luego regresa None. No uses clear_halt.
+                try:
+                    self.dev.read(EP_IN, 64, timeout=5)
+                except Exception:
+                    pass
                 return None
 
         elif self.backend_type == "mpusbapi" and self.dll_handles:
