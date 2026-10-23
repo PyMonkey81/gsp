@@ -90,7 +90,7 @@ class MainWindow(QMainWindow):
         self.traj_gen.set_tracking_points(np.radians(self.current_traj_points))
 
         self.traj_timer = QTimer(self)
-        self.traj_timer.setInterval(33)  # ~30 Hz execution loop
+        self.traj_timer.setInterval(33)  # ~33 Hz execution loop
         self.traj_start_time = 0.0
         self.traj_pause_time = 0.0
         self.traj_elapsed = 0.0
