@@ -260,9 +260,10 @@ class LacUsbDevice:
         """0x10 GET_FEEDBACK: Reads current actuator ADC position (0..1023) with 80 ms timeout."""
         res = self.transfer_packet(CMD_GET_FEEDBACK, 0, timeout_ms=timeout_ms)
         if res is not None:
-            val = max(0, min(1023, int(res[1])))
-            self.last_raw_pos = val
-            return val
+            val = int(res[1])
+            if 0 <= val <= 1023:
+                self.last_raw_pos = val
+                return val
         return None
 
     def set_position_raw(self, target_raw: int, timeout_ms: int = 80) -> Optional[int]:
@@ -273,9 +274,10 @@ class LacUsbDevice:
         raw = max(0, min(1023, int(round(target_raw))))
         res = self.transfer_packet(CMD_SET_POSITION, raw, timeout_ms=timeout_ms)
         if res is not None:
-            fb = max(0, min(1023, int(res[1])))
-            self.last_raw_pos = fb
-            return fb
+            fb = int(res[1])
+            if 0 <= fb <= 1023:
+                self.last_raw_pos = fb
+                return fb
         return None
 
     def apply_configuration(self, cfg: dict, save_to_eeprom: bool = False) -> bool:
@@ -656,6 +658,7 @@ class LacUsbHubController:
                         self._on_axis_failure(axis_num)
         finally:
             self._usb_busy = False
+            self._last_usb_io_time = time.perf_counter()
             self.lock.release()
 
         return actual_pct

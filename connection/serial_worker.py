@@ -103,7 +103,9 @@ class SerialWorker(QObject):
         # 4. Read initial real positions (0x10 GET_FEEDBACK)
         self._actual_percent = self.lac_hub.read_all_feedback_percent(self._actual_percent)
         self._target_percent = self._actual_percent.copy()
-        self._last_usb_io_time = time.perf_counter()
+        now_init = time.perf_counter()
+        self._last_0x10_time = now_init
+        self._last_usb_io_time = now_init
 
         self.devices_updated.emit(self.lac_hub.get_devices_summary())
         self.connected.emit(True)
@@ -205,7 +207,9 @@ class SerialWorker(QObject):
                 self._usb_busy = True
                 try:
                     self._actual_percent = self.lac_hub.read_all_feedback_percent(self._actual_percent)
-                    self._last_usb_io_time = time.perf_counter()
+                    now_io = time.perf_counter()
+                    self._last_0x10_time = now_io
+                    self._last_usb_io_time = now_io
                 finally:
                     self._usb_busy = False
                     self._process_pending_target()
@@ -238,9 +242,11 @@ class SerialWorker(QObject):
                     self._usb_busy = True
                     try:
                         fb = self.lac_hub.set_single_position_percent(axis_1based, val)
+                        now = time.perf_counter()
+                        self._last_0x20_time = now
+                        self._last_usb_io_time = now
                         if fb is not None:
                             self._actual_percent[axis_1based - 1] = fb
-                        self._last_usb_io_time = time.perf_counter()
                         self.telemetry_received.emit(self._actual_percent.tolist())
                     finally:
                         self._usb_busy = False
@@ -351,13 +357,12 @@ class SerialWorker(QObject):
         self._pending_timer.stop()
         self._target_percent = np.asarray(target_list, dtype=np.float64)
         self._usb_busy = True
+        self._last_0x20_time = time.perf_counter()
         try:
             self._actual_percent = self.lac_hub.set_all_positions_percent(
                 self._target_percent.tolist(), self._actual_percent
             )
-            now = time.perf_counter()
-            self._last_0x20_time = now
-            self._last_usb_io_time = now
+            self._last_usb_io_time = time.perf_counter()
             self.telemetry_received.emit(self._actual_percent.tolist())
         finally:
             self._usb_busy = False
