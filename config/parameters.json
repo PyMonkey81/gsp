@@ -96,12 +96,12 @@
     ]
   ],
   "LAC_CONFIG": {
-    "accuracy": 8,
+    "accuracy": 16,
     "retract_limit": 0,
     "extend_limit": 1023,
     "movement_threshold": 3,
     "stall_time": 10000,
-    "pwm_threshold": 100,
+    "pwm_threshold": 140,
     "derivative_threshold": 3,
     "max_derivative": 1023,
     "min_derivative": 0,
@@ -110,7 +110,7 @@
     "kp": 1,
     "kd": 6,
     "average_rc": 4,
-    "average_adc": 8,
+    "average_adc": 6,
     "invert_axis": [
       false,
       false,
@@ -119,5 +119,15 @@
       false,
       false
     ]
+  },
+  "LAC_AXIS_OVERRIDES": {
+    "3": {
+      "accuracy": 10,
+      "min_pwm": 90,
+      "kd": 6,
+      "kp": 1,
+      "pwm_threshold": 90,
+      "average_adc": 6
+    }
   }
 }

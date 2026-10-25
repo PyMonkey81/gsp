@@ -55,6 +55,12 @@ class SerialWorker(QObject):
             cfg.update(params["LAC_CONFIG"])
         return cfg
 
+    def _load_lac_overrides(self) -> dict:
+        params = load_parameters()
+        if isinstance(params, dict) and "LAC_AXIS_OVERRIDES" in params:
+            return params["LAC_AXIS_OVERRIDES"]
+        return {}
+
     @Slot(str, int)
     def connect_port(self, port_name: str, baudrate: int = 115200):
         self.port_name = port_name
@@ -94,9 +100,13 @@ class SerialWorker(QObject):
         self.is_usb_connected = True
         self.message_received.emit(f"[USB-LAC] Se detectaron {count}/6 tarjetas LAC en el Hub USB.")
 
-        # 3. Upload configuration automatically on startup/connect
+        # 3. Upload configuration automatically on startup/connect:
+        # Sube LAC_CONFIG a las seis y después aplica el override únicamente a la tarjeta del eje 3.
         lac_cfg = self._load_lac_cfg()
-        _, cfg_logs = self.lac_hub.upload_configuration_all(lac_cfg, save_to_eeprom=False)
+        axis_overrides = self._load_lac_overrides()
+        _, cfg_logs = self.lac_hub.upload_configuration_all(
+            lac_cfg, save_to_eeprom=False, axis_overrides=axis_overrides
+        )
         for msg in cfg_logs:
             self.message_received.emit(msg)
 
@@ -178,7 +188,10 @@ class SerialWorker(QObject):
             self._usb_busy = True
             try:
                 lac_cfg = self._load_lac_cfg()
-                _, cfg_logs = self.lac_hub.upload_configuration_all(lac_cfg, save_to_eeprom=False)
+                axis_overrides = self._load_lac_overrides()
+                _, cfg_logs = self.lac_hub.upload_configuration_all(
+                    lac_cfg, save_to_eeprom=False, axis_overrides=axis_overrides
+                )
                 for msg in cfg_logs:
                     self.message_received.emit(msg)
                 self.devices_updated.emit(self.lac_hub.get_devices_summary())
@@ -404,7 +417,10 @@ class SerialWorker(QObject):
 
         self._usb_busy = True
         try:
-            _, logs = self.lac_hub.upload_configuration_all(cfg, save_to_eeprom=save_eeprom)
+            axis_overrides = self._load_lac_overrides()
+            _, logs = self.lac_hub.upload_configuration_all(
+                cfg, save_to_eeprom=save_eeprom, axis_overrides=axis_overrides
+            )
             for msg in logs:
                 self.message_received.emit(msg)
             self.devices_updated.emit(self.lac_hub.get_devices_summary())

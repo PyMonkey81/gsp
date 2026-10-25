@@ -23,7 +23,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from config.parameters import DEFAULT_LAC_CONFIG, STROKE, save_lac_config
+from config.parameters import DEFAULT_LAC_CONFIG, STROKE, save_lac_config, load_parameters
 from connection.lac_usb_driver import LacUsbHubController
 
 
@@ -183,10 +183,13 @@ class LacAutoTuner:
         target_raw: int,
         accuracy_adc: int,
         timeout_s: float = 3.2,
+        eval_axes: Optional[List[int]] = None,
     ) -> StepMetrics:
         """
         Executes a synchronous step from start_raw to target_raw and computes closed-loop metrics:
         overshoot, steady-state error, settling time, peak speed, reversals (hunting), and cost J.
+        If eval_axes is None, evaluates on all non-3 axes (L1, L2, L4, L5, L6) when available,
+        so the common configuration is not penalized by axis 3.
         """
         timestamps, history = self._wait_until_settled(
             target_raw=target_raw,
@@ -203,7 +206,13 @@ class LacAutoTuner:
         peak_speed = 0.0
         total_reversals = 0
 
-        for ax, samples in history.items():
+        target_axes = eval_axes
+        if target_axes is None:
+            has_other_axes = any(ax != 3 for ax in history.keys())
+            target_axes = [ax for ax in history.keys() if ax != 3] if has_other_axes else list(history.keys())
+
+        for ax in target_axes:
+            samples = history.get(ax, [])
             y = np.asarray(samples, dtype=np.float64)
             if len(y) < 3:
                 continue
@@ -315,11 +324,14 @@ class LacAutoTuner:
             time.sleep(0.005)
 
         max_p2p = 0
+        p2p_by_axis: Dict[int, int] = {}
         for ax in axes:
             arr = np.asarray(adc_samples[ax], dtype=np.float64)
             p2p = int(np.max(arr) - np.min(arr))
             std = float(np.std(arr))
-            max_p2p = max(max_p2p, p2p)
+            p2p_by_axis[ax] = p2p
+            if ax != 3 or len(axes) == 1:
+                max_p2p = max(max_p2p, p2p)
             emit(
                 f"  -> L{ax}: ADC inicial={int(arr[-1])}/1023 | Ruido σ={std:.2f} ADC, "
                 f"Pico-a-Pico={p2p} ADC ({p2p * mm_per_adc:.2f} mm)"
@@ -337,7 +349,7 @@ class LacAutoTuner:
         work_cfg["average_adc"] = best_avg_adc
         work_cfg["accuracy"] = base_accuracy
         emit(
-            f"[AUTOTUNE] Filtro ADC óptimo: average_adc={best_avg_adc} (0x0F) | "
+            f"[AUTOTUNE] Filtro ADC óptimo (ejes estándar): average_adc={best_avg_adc} (0x0F) | "
             f"Accuracy base={base_accuracy} ADC (±{base_accuracy * mm_per_adc:.2f} mm)"
         )
 
@@ -362,7 +374,9 @@ class LacAutoTuner:
             for ax, dev in self.hub.devices_by_axis.items():
                 dev.transfer_packet(0x0B, candidate_pwm)
             _, hist = self._wait_until_settled(micro_raw, tolerance_adc=base_accuracy + 1, timeout_s=0.65)
-            errors = [abs(hist[ax][-1] - micro_raw) for ax in axes if len(hist[ax]) > 0]
+            errors = [abs(hist[ax][-1] - micro_raw) for ax in axes if ax != 3 and len(hist[ax]) > 0]
+            if not errors:
+                errors = [abs(hist[ax][-1] - micro_raw) for ax in axes if len(hist[ax]) > 0]
             max_err = max(errors) if errors else 999
             if max_err <= base_accuracy + 2:
                 best_min_pwm = min(130, candidate_pwm + 5)
@@ -446,8 +460,6 @@ class LacAutoTuner:
                 best_metrics = metrics
 
             # Datasheet Page 8 rules:
-            # - Overshoot / reversals: reduce Kp, widen PWM_THRESHOLD braking zone, soften min_pwm
-            # - Steady-state error > accuracy: increase Kp, min_pwm, and Kd anti-stall rate
             if metrics.overshoot_adc > 2.0 or metrics.reversals > 0:
                 cand_cfg["pwm_threshold"] = min(170, int(cand_cfg["pwm_threshold"]) + 20)
                 if int(cand_cfg["kp"]) > 1:
@@ -465,16 +477,148 @@ class LacAutoTuner:
                 cand_cfg["kp"] = min(4, int(cand_cfg["kp"]) + 1)
 
         # ---------------------------------------------------------------------
-        # STAGE 5: Apply Optimal Config to RAM, Return Smoothly & Save to JSON
+        # ETAPA ESPECÍFICA PARA EJE 3 (L3) EN LAZO ACOPLADO:
+        # 1. No se sube el resultado común a L3.
+        # 2. Se toma la config ganadora de las otras cinco y se aplica en RAM a L1, L2, L4, L5, L6.
+        # 3. Solo en devices_by_axis[3], se prueban las 12 combinaciones:
+        #    min_pwm ∈ (90, 110, 130), kd ∈ (6, 10), pwm_threshold ∈ (60, 90).
+        #    Fijo: Kp=1, accuracy ∈ [8, 12], average_adc=6.
+        #    Cada prueba: dev3.apply_configuration en RAM y escalón sincronizado a las 6 patas.
+        # 4. La nota de L3 se calcula solo con su historia. Sirve si error final <= 16 y rev <= 1.
+        # 5. Si en una prueba L3 no contesta, se aborta solo esa pasada sin castigar a las otras.
+        # 6. Si ninguna cumple, no se cambia la config que L3 ya tenía y se escribe en el log.
         # ---------------------------------------------------------------------
-        self.hub.upload_configuration_all(best_cfg, save_to_eeprom=save_to_eeprom)
+        emit("-" * 68)
+        emit("[AUTOTUNE] Aplicando configuración ganadora a las cinco tarjetas estándar (L1, L2, L4, L5, L6) en RAM...")
+        for ax, dev in sorted(self.hub.devices_by_axis.items()):
+            if ax != 3:
+                dev.apply_configuration(best_cfg, save_to_eeprom=False)
 
+        params_data = load_parameters()
+        axis_overrides = dict(params_data.get("LAC_AXIS_OVERRIDES", {}))
+        l3_existing_override = dict(axis_overrides.get("3", {})) if "3" in axis_overrides else None
+
+        if 3 in self.hub.devices_by_axis:
+            emit("-" * 68)
+            emit("[AUTOTUNE] Sintonización específica para Eje 3 (L3) acoplado al resto de la plataforma...")
+            emit("  Espacio de búsqueda L3 (12 combinaciones): min_pwm ∈ (90, 110, 130), kd ∈ (6, 10), pwm_threshold ∈ (60, 90)")
+            emit("  Valores fijos L3: Kp=1, average_adc=6, accuracy ∈ [8, 12]. Las seis patas reciben el mismo 0x20.")
+
+            p2p_3 = p2p_by_axis.get(3, 6)
+            accuracy_l3 = int(np.clip(p2p_3 + 4, 8, 12))
+            emit(f"  Accuracy seleccionado para L3: {accuracy_l3} ADC (ruido medido: {p2p_3} ADC)")
+
+            dev3 = self.hub.devices_by_axis[3]
+            best_l3_candidate = None
+            best_l3_cost = float("inf")
+            best_l3_metrics = None
+
+            l3_combinations = []
+            for min_pwm in (90, 110, 130):
+                for kd in (6, 10):
+                    for pwm_th in (60, 90):
+                        l3_combinations.append((min_pwm, kd, pwm_th))
+
+            for idx, (min_pwm, kd, pwm_th) in enumerate(l3_combinations, start=1):
+                trial_l3 = dict(best_cfg)
+                trial_l3["accuracy"] = accuracy_l3
+                trial_l3["min_pwm"] = min_pwm
+                trial_l3["kd"] = kd
+                trial_l3["kp"] = 1
+                trial_l3["pwm_threshold"] = pwm_th
+                trial_l3["average_adc"] = 6
+
+                # 1. Configuración de L3 a RAM
+                ok_apply = dev3.apply_configuration(trial_l3, save_to_eeprom=False)
+                if not ok_apply:
+                    emit(f"  [L3 {idx:2d}/12] min_pwm={min_pwm:3d}  kd={kd:2d}  pwm_th={pwm_th:2d} -> Falló escritura en L3. Pasada abortada.")
+                    continue
+
+                # 2. Alinear sincronizadamente al inicio del escalón (low_raw)
+                self._wait_until_settled(low_raw, tolerance_adc=10, timeout_s=2.5)
+
+                # 3. Mismo escalón sincronizado de siempre (low_raw -> high_raw)
+                timestamps, history = self._wait_until_settled(
+                    target_raw=high_raw,
+                    tolerance_adc=max(accuracy_l3 + 2, 6),
+                    timeout_s=3.0,
+                )
+
+                samples_3 = history.get(3, [])
+                if len(samples_3) < 4:
+                    emit(f"  [L3 {idx:2d}/12] min_pwm={min_pwm:3d}  kd={kd:2d}  pwm_th={pwm_th:2d} -> L3 sin respuesta. Pasada abortada.")
+                    continue
+
+                # 4. Nota de L3 calculada solo con su historia
+                y3 = np.asarray(samples_3, dtype=np.float64)
+                direction = 1.0 if high_raw >= low_raw else -1.0
+                signed_excursion = (y3 - float(high_raw)) * direction
+                overshoot = float(max(0.0, np.max(signed_excursion)))
+                err = int(abs(y3[-1] - high_raw))
+
+                reversals = 0
+                prev = 0
+                for a, b in zip(y3, y3[1:]):
+                    d = b - a
+                    if abs(d) < 2:
+                        continue
+                    sign = 1 if d > 0 else -1
+                    if prev and sign != prev:
+                        reversals += 1
+                    prev = sign
+
+                cost = 8.0 * overshoot + 30.0 * float(reversals) + 10.0 * max(0, err - accuracy_l3) + 2.0 * err
+                is_valid = (err <= 16 and reversals in (0, 1))
+                tag = "CUMPLE" if is_valid else "DESCARTADA"
+
+                emit(
+                    f"  [L3 {idx:2d}/12] min_pwm={min_pwm:3d}  kd={kd:2d}  pwm_th={pwm_th:2d} | "
+                    f"err={err:2d}  over={overshoot:4.1f}  rev={reversals} | costo={cost:5.1f} [{tag}]"
+                )
+
+                if is_valid and cost < best_l3_cost:
+                    best_l3_cost = cost
+                    best_l3_candidate = dict(trial_l3)
+                    best_l3_metrics = {"err": err, "overshoot": overshoot, "reversals": reversals, "cost": cost}
+
+            if best_l3_candidate is not None:
+                dev3.apply_configuration(best_l3_candidate, save_to_eeprom=False)
+                override_3 = {
+                    "accuracy": int(best_l3_candidate["accuracy"]),
+                    "min_pwm": int(best_l3_candidate["min_pwm"]),
+                    "kd": int(best_l3_candidate["kd"]),
+                    "kp": int(best_l3_candidate["kp"]),
+                    "pwm_threshold": int(best_l3_candidate["pwm_threshold"]),
+                    "average_adc": int(best_l3_candidate["average_adc"]),
+                }
+                axis_overrides["3"] = override_3
+                emit(
+                    f"[AUTOTUNE] Configuración ganadora para L3 aplicada en RAM y registrada en LAC_AXIS_OVERRIDES:\n"
+                    f"  -> accuracy={override_3['accuracy']}, min_pwm={override_3['min_pwm']}, kd={override_3['kd']}, "
+                    f"kp={override_3['kp']}, pwm_threshold={override_3['pwm_threshold']}, average_adc={override_3['average_adc']} "
+                    f"(err={best_l3_metrics['err']}, over={best_l3_metrics['overshoot']:.1f}, rev={best_l3_metrics['reversals']}, costo={best_l3_metrics['cost']:.1f})"
+                )
+            else:
+                emit("[AUTOTUNE] Ninguna de las 12 combinaciones para L3 cumplió el criterio (error final <= 16 y reversiones <= 1).")
+                if l3_existing_override:
+                    cfg3_restore = dict(best_cfg)
+                    cfg3_restore.update(l3_existing_override)
+                    dev3.apply_configuration(cfg3_restore, save_to_eeprom=False)
+                    emit(f"[AUTOTUNE] Se conserva la configuración que L3 ya tenía: {l3_existing_override}")
+                else:
+                    emit("[AUTOTUNE] Se conserva la configuración que L3 ya tenía.")
+        else:
+            emit("[AUTOTUNE] Eje 3 no detectado en el Hub USB; se omite sintonía específica de L3.")
+
+        # Regresar actuadores suavemente a la posición inicial sincrónica
         restore_target = max(0, min(1023, init_avg_raw))
         emit(f"[AUTOTUNE] Regresando actuadores a su posición inicial ({restore_target}/1023 ADC)...")
         self._smooth_align_all(restore_target)
 
-        # Save to config/parameters.json so startup always loads these tuned values into RAM
-        save_lac_config(best_cfg)
+        # Guardado en config/parameters.json:
+        # LAC_CONFIG sigue siendo la de las cinco.
+        # LAC_AXIS_OVERRIDES guarda la clave "3" con solo los campos que cambian.
+        save_lac_config(best_cfg, axis_overrides=axis_overrides)
 
         acc_mm = int(best_cfg["accuracy"]) * mm_per_adc
         err_mm = best_metrics.steady_error_adc * mm_per_adc
@@ -488,9 +632,11 @@ class LacAutoTuner:
             f"  • PWM Minimum (0x0B)      = {best_cfg['min_pwm']} / 1023\n"
             f"  • Movement/Deriv Thresh   = {best_cfg['movement_threshold']} (0x04 / 0x07)\n"
             f"  • Average ADC (0x0F)      = {best_cfg['average_adc']} muestras\n"
-            f"  • Desempeño medido        = Error SS: {best_metrics.steady_error_adc:.1f} ADC ({err_mm:.2f} mm), "
+            f"  • Desempeño medido (5 LAC)= Error SS: {best_metrics.steady_error_adc:.1f} ADC ({err_mm:.2f} mm), "
             f"Overshoot: {best_metrics.overshoot_adc:.1f} ADC, t_s: {best_metrics.settling_time_s:.2f} s"
         )
+        if "3" in axis_overrides:
+            emit(f"  • Override Eje 3 (L3)     = {axis_overrides['3']}")
         emit("=" * 68)
 
         return True, best_cfg, logs

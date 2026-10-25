@@ -22,6 +22,7 @@ class SerialManager(QObject):
     safe_mode_changed = Signal(bool)
     devices_updated = Signal(list)
     lac_config_updated = Signal(dict)
+    positions_requested = Signal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -29,6 +30,7 @@ class SerialManager(QObject):
         self.thread = QThread(self)
         self.worker = SerialWorker()
         self.worker.moveToThread(self.thread)
+        self.positions_requested.connect(self.worker.send_positions, Qt.ConnectionType.QueuedConnection)
 
         self._incoming_pending = False
         self.read_timer = QTimer(self)
@@ -204,7 +206,7 @@ class SerialManager(QObject):
     def disconnect_port(self):
         QMetaObject.invokeMethod(self.worker, "disconnect_port", Qt.ConnectionType.QueuedConnection)
 
-    def send_positions(self, positions: list):
+    def send_positions(self, positions):
         """
         Envía consignas de posición a las 6 tarjetas LAC por USB (0.0..100.0% -> 0..1023 de 10 bits).
         """
@@ -212,12 +214,7 @@ class SerialManager(QObject):
             self.error_occurred.emit("Se requieren exactamente 6 posiciones")
             return
 
-        QMetaObject.invokeMethod(
-            self.worker,
-            "send_positions",
-            Qt.ConnectionType.QueuedConnection,
-            Q_ARG(list, list(positions)),
-        )
+        self.positions_requested.emit([float(p) for p in positions])
 
     def send_raw(self, command: str):
         """Envía comando al Worker USB LAC."""

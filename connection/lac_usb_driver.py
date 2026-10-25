@@ -528,8 +528,17 @@ class LacUsbHubController:
                     )
                     break
 
-    def upload_configuration_all(self, cfg: dict, save_to_eeprom: bool = False) -> Tuple[int, List[str]]:
-        """Uploads configuration parameters to all connected LAC boards."""
+    def upload_configuration_all(
+        self,
+        cfg: dict,
+        save_to_eeprom: bool = False,
+        axis_overrides: dict | None = None
+    ) -> Tuple[int, List[str]]:
+        """
+        Uploads configuration parameters (0x01..0x0F) to all connected LAC boards.
+        If axis_overrides is provided (e.g. {"3": {...}}), applies specific parameters
+        to the specified axis after uploading the common base configuration to all six.
+        """
         if not self.lock.acquire(blocking=False):
             return 0, ["[USB-LAC] Bus USB ocupado; transferencia en curso."]
 
@@ -551,7 +560,43 @@ class LacUsbHubController:
             logs.append(
                 f"[USB-LAC] Configuración subida a {ok_count}/{len(self.devices_by_axis)} tarjetas LAC ({mode_str})."
             )
+
+            # Aplica overrides de eje específico (ej. eje 3)
+            if axis_overrides and isinstance(axis_overrides, dict):
+                for ax_key, over in axis_overrides.items():
+                    try:
+                        ax_num = int(ax_key)
+                    except (ValueError, TypeError):
+                        continue
+                    dev = self.devices_by_axis.get(ax_num)
+                    if dev is not None and dev.is_open and isinstance(over, dict):
+                        cfg_custom = dict(cfg)
+                        cfg_custom.update(over)
+                        if dev.apply_configuration(cfg_custom, save_to_eeprom=save_to_eeprom):
+                            logs.append(
+                                f"[USB-LAC] Override aplicado a L{ax_num} (RAM): {over}"
+                            )
+                        else:
+                            logs.append(
+                                f"[USB-LAC] Error aplicando override a L{ax_num}."
+                            )
+
             return ok_count, logs
+        finally:
+            self._usb_busy = False
+            self._last_usb_io_time = time.perf_counter()
+            self.lock.release()
+
+    def apply_axis_configuration(self, axis: int, cfg: dict, save_to_eeprom: bool = False) -> bool:
+        """Applies configuration in RAM (or EEPROM) to a single axis (1..6)."""
+        if not self.lock.acquire(blocking=False):
+            return False
+        self._usb_busy = True
+        try:
+            dev = self.devices_by_axis.get(axis)
+            if dev is None or not dev.is_open:
+                return False
+            return dev.apply_configuration(cfg, save_to_eeprom=save_to_eeprom)
         finally:
             self._usb_busy = False
             self._last_usb_io_time = time.perf_counter()

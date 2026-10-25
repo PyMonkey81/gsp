@@ -125,7 +125,19 @@ DEFAULT_LAC_CONFIG = {
     "invert_axis": [False, False, False, False, False, False],
 }
 
+DEFAULT_LAC_AXIS_OVERRIDES = {
+    "3": {
+        "accuracy": 10,
+        "min_pwm": 90,
+        "kd": 6,
+        "kp": 1,
+        "pwm_threshold": 90,
+        "average_adc": 6,
+    }
+}
+
 LAC_CONFIG = dict(DEFAULT_LAC_CONFIG)
+LAC_AXIS_OVERRIDES = dict(DEFAULT_LAC_AXIS_OVERRIDES)
 
 
 def q_to_extension(q_mm: np.ndarray, l0: float = None) -> np.ndarray:
@@ -181,6 +193,8 @@ def load_parameters() -> dict:
                     merged = dict(DEFAULT_LAC_CONFIG)
                     merged.update(data["LAC_CONFIG"])
                     data["LAC_CONFIG"] = merged
+                if "LAC_AXIS_OVERRIDES" not in data:
+                    data["LAC_AXIS_OVERRIDES"] = dict(DEFAULT_LAC_AXIS_OVERRIDES)
                 return data
         except Exception:
             pass
@@ -193,12 +207,16 @@ def load_parameters() -> dict:
         "TRAJ_POINTS": TRAJ_POINTS,
         "Az": Az.tolist(), "Bz": Bz.tolist(),
         "LAC_CONFIG": dict(DEFAULT_LAC_CONFIG),
+        "LAC_AXIS_OVERRIDES": dict(DEFAULT_LAC_AXIS_OVERRIDES),
     }
 
 
-def save_lac_config(lac_cfg: dict) -> bool:
-    """Guarda el bloque LAC_CONFIG en config/parameters.json preservando el resto de parámetros."""
-    global LAC_CONFIG
+def save_lac_config(lac_cfg: dict, axis_overrides: dict | None = None) -> bool:
+    """
+    Guarda el bloque LAC_CONFIG (para las cinco tarjetas estándar) y opcionalmente
+    LAC_AXIS_OVERRIDES (por ejemplo para la tarjeta del eje 3) en config/parameters.json.
+    """
+    global LAC_CONFIG, LAC_AXIS_OVERRIDES
     merged = dict(DEFAULT_LAC_CONFIG)
     merged.update(lac_cfg or {})
     LAC_CONFIG = merged
@@ -206,6 +224,11 @@ def save_lac_config(lac_cfg: dict) -> bool:
     json_path = Path(__file__).resolve().parent / "parameters.json"
     data = load_parameters()
     data["LAC_CONFIG"] = merged
+    if axis_overrides is not None:
+        data["LAC_AXIS_OVERRIDES"] = dict(axis_overrides)
+        LAC_AXIS_OVERRIDES = dict(axis_overrides)
+    elif "LAC_AXIS_OVERRIDES" in data:
+        LAC_AXIS_OVERRIDES = dict(data["LAC_AXIS_OVERRIDES"])
     try:
         with open(json_path, "w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2, ensure_ascii=False)
